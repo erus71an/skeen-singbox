@@ -1,0 +1,9 @@
+.build/
+dist/
+profile/
+profiles/
+*.profile
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc

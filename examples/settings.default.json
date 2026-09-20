@@ -1,0 +1,32 @@
+{
+  "profile": "default",
+  "policy": {
+    "name": "SKeen",
+    "table4": ""
+  },
+  "tun": {
+    "name": "SKeen0",
+    "address": "172.19.0.1/30",
+    "interface_name": "opkgtun0",
+    "default_route": 1,
+    "txqueuelen": 2000,
+    "wait_link_seconds": 15
+  },
+  "singbox": {
+    "bin": "/opt/bin/keen-singbox-core",
+    "config": "/opt/etc/keen-singbox/config.json",
+    "work_dir": "/opt/etc/keen-singbox",
+    "version": "1.13.20"
+  },
+  "runtime": {
+    "dir": "/tmp/keen-singbox",
+    "log_level": "warn"
+  },
+  "firewall": {
+    "tun_rules_enabled": 1
+  },
+  "auto_start": {
+    "enabled": 1,
+    "delay": 15
+  }
+}

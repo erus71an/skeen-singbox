@@ -1,0 +1,2044 @@
+#!/bin/sh
+#
+# Standalone Keenetic sing-box + OpkgTun policy runner.
+# Inspired by SKeen's MIT-licensed Keenetic/OpkgTun handling, but kept separate
+# from SKeen paths and service files.
+
+set -u
+
+PATH="/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+ENTWARE_DIR="${ENTWARE_DIR:-/opt}"
+WORK_DIR="${KEEN_SINGBOX_WORK_DIR:-${ENTWARE_DIR}/etc/keen-singbox}"
+TEMPLATE_DIR="${KEEN_SINGBOX_TEMPLATE_DIR:-${WORK_DIR}/templates}"
+BIN_DIR="${KEEN_SINGBOX_BIN_DIR:-${ENTWARE_DIR}/bin}"
+INIT_DIR="${KEEN_SINGBOX_INIT_DIR:-${ENTWARE_DIR}/etc/init.d}"
+NETFILTER_DIR="${KEEN_SINGBOX_NETFILTER_DIR:-${ENTWARE_DIR}/etc/ndm/netfilter.d}"
+SETTINGS="${KEEN_SINGBOX_SETTINGS:-${WORK_DIR}/settings.json}"
+CONFIG="${KEEN_SINGBOX_CONFIG:-${WORK_DIR}/config.json}"
+RUNTIME_DIR="${KEEN_SINGBOX_RUNTIME_DIR:-/tmp/keen-singbox}"
+TMP_DIR="${KEEN_SINGBOX_TMP_DIR:-${RUNTIME_DIR}/tmp}"
+LOG_FILE="${KEEN_SINGBOX_LOG:-${RUNTIME_DIR}/keen-singbox.log}"
+SINGBOX_BIN="${KEEN_SINGBOX_CORE:-${BIN_DIR}/keen-singbox-core}"
+PID_FILE="${KEEN_SINGBOX_PID_FILE:-/tmp/run/keen-singbox.pid}"
+LOCK_DIR="${KEEN_SINGBOX_LOCK_DIR:-${RUNTIME_DIR}/service.lock}"
+INIT_SCRIPT="${INIT_DIR}/S99KeenSingBox"
+FIREWALL_HOOK="${NETFILTER_DIR}/keen-singbox-firewall.sh"
+RUNNER_SCRIPT="${KEEN_SINGBOX_RUNNER:-${RUNTIME_DIR}/runner.sh}"
+SELF_BIN="${BIN_DIR}/keen-singbox"
+ACTION="${1:-help}"
+DRY_RUN="${KEEN_SINGBOX_DRY_RUN:-0}"
+JSONFILTER_BIN="${KEEN_SINGBOX_JSONFILTER:-jsonfilter}"
+NDMC_BIN="${KEEN_SINGBOX_NDMC:-ndmc}"
+IP_BIN="${KEEN_SINGBOX_IP:-ip}"
+IPTABLES_BIN="${KEEN_SINGBOX_IPTABLES:-iptables}"
+INTERFACE_DATA_CACHE=""
+POLICY_DATA_CACHE=""
+IP_RULE_DATA_CACHE=""
+CHAIN_TUN="keen_singbox_tun"
+CHAIN_TUN_NAT="keen_singbox_nat"
+LOG_MAX_BYTES="${KEEN_SINGBOX_LOG_MAX_BYTES:-524288}"
+LOG_BACKUPS="${KEEN_SINGBOX_LOG_BACKUPS:-2}"
+
+DEPENDENCIES="curl jsonfilter ip-full start-stop-daemon tar"
+SINGBOX_API_URL="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+CURL_RESOLVE_FIX="--resolve release-assets.githubusercontent.com:443:185.199.108.133"
+
+info() { printf '[INFO]: %s\n' "$1"; log "INFO" "$1"; }
+ok() { printf '[OK]: %s\n' "$1"; log "OK" "$1"; }
+warn() { printf '[WARN]: %s\n' "$1"; log "WARN" "$1"; }
+err() { printf '[ERROR]: %s\n' "$1" >&2; log "ERROR" "$1"; }
+die() { err "$1"; exit 1; }
+
+log() {
+  local level="${1:-INFO}"
+  local message="${2:-}"
+  local timestamp
+
+  case "${LOG_LEVEL:-error}:$level" in
+    debug:*|info:INFO|info:OK|info:WARN|info:ERROR|warn:WARN|warn:ERROR|error:ERROR) ;;
+    *) return 0 ;;
+  esac
+
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || return 0
+  rotate_log_file "$LOG_FILE"
+  timestamp="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date 2>/dev/null || printf unknown)"
+  printf '%s [%s] %s\n' "$timestamp" "$level" "$message" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+show_help() {
+  cat <<EOF
+keen-singbox - standalone Keenetic sing-box + OpkgTun policy runner
+
+Usage:
+  keen-singbox install [default|lowmem]
+  keen-singbox install-config [default|lowmem]
+  keen-singbox install-singbox
+  keen-singbox install-init
+  keen-singbox validate
+  keen-singbox start [--init]
+  keen-singbox stop
+  keen-singbox restart
+  keen-singbox reload
+  keen-singbox status
+  keen-singbox logs
+  keen-singbox clean-runtime
+  keen-singbox set-txqueuelen <value>
+  keen-singbox doctor
+
+Environment:
+  SINGBOX_VERSION=<version>       Install exact sing-box release version.
+  SINGBOX_URL=<url>               Download sing-box .ipk from an explicit URL.
+  SINGBOX_PACKAGE=<path>          Install sing-box from a local .ipk file.
+  SINGBOX_MIRROR_BASE=<url>       Package mirror base URL.
+  SINGBOX_DOWNLOAD_MAX_TIME=180   curl max time in seconds.
+  KEEN_SINGBOX_PROFILE=default    Installed template profile: default|lowmem.
+  KEEN_SINGBOX_DRY_RUN=1         Print mutating commands instead of running them.
+  KEEN_SINGBOX_LOG_MAX_BYTES=524288  Rotate wrapper logs at this size.
+EOF
+}
+
+script_dir() {
+  CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd
+}
+
+run_cmd() {
+  if [ "$DRY_RUN" = "1" ]; then
+    printf '[DRY-RUN]:'
+    printf ' %s' "$@"
+    printf '\n'
+    return 0
+  fi
+  "$@"
+}
+
+rotate_log_file() {
+  local path="${1:-}"
+  local size backup index
+
+  [ -n "$path" ] || return 0
+  [ -f "$path" ] || return 0
+  case "$LOG_MAX_BYTES" in
+    ""|*[!0-9]*) return 0 ;;
+  esac
+  size="$(wc -c <"$path" 2>/dev/null | tr -d '[:space:]')"
+  [ "${size:-0}" -ge "$LOG_MAX_BYTES" ] 2>/dev/null || return 0
+
+  index="$LOG_BACKUPS"
+  while [ "$index" -gt 1 ] 2>/dev/null; do
+    backup="${path}.$((index - 1))"
+    [ -f "$backup" ] && mv -f "$backup" "${path}.${index}" 2>/dev/null || true
+    index=$((index - 1))
+  done
+  [ "$LOG_BACKUPS" -gt 0 ] 2>/dev/null &&
+    mv -f "$path" "${path}.1" 2>/dev/null || true
+  : >"$path" 2>/dev/null || true
+}
+
+acquire_service_lock() {
+  local owner lock_pid attempt=0
+
+  mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null ||
+    die "Failed to create service lock directory: $(dirname "$LOCK_DIR")"
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    lock_pid="$(sed -n '1p' "$LOCK_DIR/pid" 2>/dev/null || true)"
+    case "$lock_pid" in
+      ''|*[!0-9]*) ;;
+      *)
+        if kill -0 "$lock_pid" 2>/dev/null; then
+          die "Another keen-singbox operation is already running (pid $lock_pid)"
+        fi
+        ;;
+    esac
+    rm -f "$LOCK_DIR/pid" 2>/dev/null || true
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 3 ] || die "Failed to acquire service lock: $LOCK_DIR"
+  done
+  owner="$$"
+  printf '%s\n' "$owner" >"$LOCK_DIR/pid" || {
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    die "Failed to write service lock: $LOCK_DIR"
+  }
+}
+
+release_service_lock() {
+  [ -f "$LOCK_DIR/pid" ] || return 0
+  [ "$(sed -n '1p' "$LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ] || return 0
+  rm -f "$LOCK_DIR/pid" 2>/dev/null || true
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
+with_service_lock() {
+  [ -f "$SETTINGS" ] && load_settings
+  acquire_service_lock
+  trap 'release_service_lock' EXIT
+  trap 'release_service_lock; exit 143' HUP INT TERM
+  "$@"
+  local result=$?
+  trap - EXIT HUP INT TERM
+  release_service_lock
+  return "$result"
+}
+
+backup_file() {
+  local path="${1:-}"
+  local stamp
+
+  [ -f "$path" ] || return 0
+  stamp="$(date '+%Y%m%d-%H%M%S' 2>/dev/null || date +%s)"
+  cp -fp "$path" "${path}.bak.${stamp}" || die "Failed to backup $path"
+  ok "Backed up $path"
+}
+
+replace_json_atomically() {
+  local source="${1:-}"
+  local target="${2:-}"
+  local tmp_target="${target}.new.$$"
+
+  [ -f "$source" ] || die "JSON source was not found: $source"
+  cp -f "$source" "$tmp_target" || die "Failed to stage JSON: $target"
+  "$JSONFILTER_BIN" -i "$tmp_target" -e '@' >/dev/null 2>&1 || {
+    rm -f "$tmp_target" 2>/dev/null || true
+    die "Refusing to install invalid JSON: $source"
+  }
+  backup_file "$target"
+  mv -f "$tmp_target" "$target" || {
+    rm -f "$tmp_target" 2>/dev/null || true
+    die "Failed to activate JSON: $target"
+  }
+  chmod 644 "$target" 2>/dev/null || true
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command was not found: $1"
+}
+
+json_get() {
+  local file="${1:-}"
+  local expr="${2:-}"
+
+  [ -f "$file" ] || return 1
+  "$JSONFILTER_BIN" -i "$file" -e "$expr" 2>/dev/null | head -n1
+}
+
+load_settings() {
+  [ -f "$SETTINGS" ] || die "Settings not found: $SETTINGS. Run: keen-singbox install"
+
+  PROFILE="$(json_get "$SETTINGS" '@.profile')"
+  POLICY_NAME="$(json_get "$SETTINGS" '@.policy.name')"
+  POLICY_TABLE4="$(json_get "$SETTINGS" '@.policy.table4')"
+  TUN_NAME="$(json_get "$SETTINGS" '@.tun.name')"
+  TUN_ADDRESS="$(json_get "$SETTINGS" '@.tun.address')"
+  TUN_INTERFACE_NAME="$(json_get "$SETTINGS" '@.tun.interface_name')"
+  TUN_DEFAULT_ROUTE="$(json_get "$SETTINGS" '@.tun.default_route')"
+  TUN_TXQUEUELEN="$(json_get "$SETTINGS" '@.tun.txqueuelen')"
+  TUN_WAIT_LINK_SECONDS="$(json_get "$SETTINGS" '@.tun.wait_link_seconds')"
+  SINGBOX_BIN_SETTING="$(json_get "$SETTINGS" '@.singbox.bin')"
+  CONFIG_SETTING="$(json_get "$SETTINGS" '@.singbox.config')"
+  SINGBOX_WORK_DIR="$(json_get "$SETTINGS" '@.singbox.work_dir')"
+  SINGBOX_VERSION_SETTING="$(json_get "$SETTINGS" '@.singbox.version')"
+  RUNTIME_DIR_SETTING="$(json_get "$SETTINGS" '@.runtime.dir')"
+  LOG_LEVEL="$(json_get "$SETTINGS" '@.runtime.log_level')"
+  FIREWALL_TUN_RULES_ENABLED="$(json_get "$SETTINGS" '@.firewall.tun_rules_enabled')"
+  AUTO_START_ENABLED="$(json_get "$SETTINGS" '@.auto_start.enabled')"
+  AUTO_START_DELAY="$(json_get "$SETTINGS" '@.auto_start.delay')"
+
+  : "${PROFILE:=lowmem}"
+  : "${POLICY_NAME:=KeenSingBox}"
+  : "${POLICY_TABLE4:=}"
+  : "${TUN_NAME:=SKeen0}"
+  : "${TUN_ADDRESS:=172.19.0.1/30}"
+  : "${TUN_INTERFACE_NAME:=opkgtun0}"
+  : "${TUN_DEFAULT_ROUTE:=1}"
+  : "${TUN_TXQUEUELEN:=0}"
+  : "${TUN_WAIT_LINK_SECONDS:=20}"
+  : "${SINGBOX_BIN_SETTING:=$SINGBOX_BIN}"
+  : "${CONFIG_SETTING:=$CONFIG}"
+  : "${SINGBOX_WORK_DIR:=$WORK_DIR}"
+  : "${SINGBOX_VERSION_SETTING:=}"
+  : "${RUNTIME_DIR_SETTING:=$RUNTIME_DIR}"
+  : "${LOG_LEVEL:=error}"
+  : "${FIREWALL_TUN_RULES_ENABLED:=1}"
+  : "${AUTO_START_ENABLED:=1}"
+  : "${AUTO_START_DELAY:=30}"
+
+  SINGBOX_BIN="$SINGBOX_BIN_SETTING"
+  CONFIG="$CONFIG_SETTING"
+  # An explicit runtime override is useful for recovery and keeps all transient
+  # files off persistent storage during tests or emergency repairs.
+  RUNTIME_DIR="${KEEN_SINGBOX_RUNTIME_DIR:-$RUNTIME_DIR_SETTING}"
+  LOCK_DIR="${KEEN_SINGBOX_LOCK_DIR:-${RUNTIME_DIR}/service.lock}"
+  TMP_DIR="${KEEN_SINGBOX_TMP_DIR:-${RUNTIME_DIR}/tmp}"
+  LOG_FILE="${KEEN_SINGBOX_LOG:-${RUNTIME_DIR}/keen-singbox.log}"
+  RUNNER_SCRIPT="${KEEN_SINGBOX_RUNNER:-${RUNTIME_DIR}/runner.sh}"
+}
+
+is_valid_ipv4() {
+  local ip="${1:-}"
+  local octet old_ifs
+
+  old_ifs="$IFS"
+  IFS=.
+  set -- $ip
+  IFS="$old_ifs"
+
+  [ "$#" -eq 4 ] || return 1
+  for octet in "$@"; do
+    case "$octet" in
+      ""|*[!0-9]*) return 1 ;;
+    esac
+    [ "$octet" -ge 0 ] 2>/dev/null && [ "$octet" -le 255 ] 2>/dev/null || return 1
+  done
+}
+
+get_interface_data() {
+  if [ -n "${KEEN_SINGBOX_TEST_INTERFACE_DATA:-}" ]; then
+    printf '%s\n' "$KEEN_SINGBOX_TEST_INTERFACE_DATA"
+    return 0
+  fi
+  if [ -z "$INTERFACE_DATA_CACHE" ]; then
+    INTERFACE_DATA_CACHE="$("$NDMC_BIN" -c show interface 2>/dev/null)" || return 1
+  fi
+  printf '%s\n' "$INTERFACE_DATA_CACHE"
+}
+
+get_policy_data() {
+  if [ -n "${KEEN_SINGBOX_TEST_POLICY_DATA:-}" ]; then
+    printf '%s\n' "$KEEN_SINGBOX_TEST_POLICY_DATA"
+    return 0
+  fi
+  if [ -z "$POLICY_DATA_CACHE" ]; then
+    POLICY_DATA_CACHE="$("$NDMC_BIN" -c show ip policy 2>/dev/null)" || return 1
+  fi
+  printf '%s\n' "$POLICY_DATA_CACHE"
+}
+
+get_ip_rule_data() {
+  if [ -n "${KEEN_SINGBOX_TEST_IP_RULE_DATA:-}" ]; then
+    printf '%s\n' "$KEEN_SINGBOX_TEST_IP_RULE_DATA"
+    return 0
+  fi
+  if [ -z "$IP_RULE_DATA_CACHE" ]; then
+    IP_RULE_DATA_CACHE="$("$IP_BIN" rule show 2>/dev/null)" || return 1
+  fi
+  printf '%s\n' "$IP_RULE_DATA_CACHE"
+}
+
+reset_interface_cache() {
+  INTERFACE_DATA_CACHE=""
+}
+
+reset_policy_cache() {
+  POLICY_DATA_CACHE=""
+  IP_RULE_DATA_CACHE=""
+}
+
+expected_opkgtun_iface() {
+  local index
+
+  case "$TUN_INTERFACE_NAME" in
+    opkgtun[0-9]*)
+      index="${TUN_INTERFACE_NAME#opkgtun}"
+      case "$index" in
+        ""|*[!0-9]*) return 1 ;;
+      esac
+      echo "OpkgTun${index}"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+get_iface_description() {
+  local wanted_iface="${1:-}"
+  local interface_data
+
+  [ -n "$wanted_iface" ] || return 1
+  interface_data="$(get_interface_data)"
+
+  if printf '%s' "$interface_data" | grep -qi '^[[:space:]]*interface, name = '; then
+    printf '%s\n' "$interface_data" | awk -v wanted="$wanted_iface" '
+      function trim(value) {
+        gsub(/^[[:space:]]+|[[:space:]:]+$/, "", value)
+        return value
+      }
+      function flush() {
+        if (iface == wanted && desc != "") {
+          print desc
+          exit
+        }
+      }
+      tolower($0) ~ /^[[:space:]]*interface, name = / {
+        flush()
+        iface = $0
+        sub(/^[[:space:]]*[Ii]nterface, name = "?/, "", iface)
+        sub(/[" ,:].*/, "", iface)
+        desc = ""
+        if (tolower($0) ~ /description[[:space:]]*=/) {
+          desc = $0
+          sub(/^.*description[[:space:]]*=[[:space:]]*/, "", desc)
+          desc = trim(desc)
+        }
+      }
+      /^[[:space:]]*description[[:space:]]*:/ {
+        desc = $0
+        sub(/.*:[[:space:]]*/, "", desc)
+        desc = trim(desc)
+      }
+      END { flush() }
+    '
+    return
+  fi
+
+  "$JSONFILTER_BIN" -e "@.interface['$wanted_iface'].description" 2>/dev/null <<EOF
+$interface_data
+EOF
+}
+
+get_iface_by_name() {
+  local opkgtun_desc="${1:-}"
+  local interface_data inface_list iface description
+
+  [ -n "$opkgtun_desc" ] || return 1
+  interface_data="$(get_interface_data)"
+
+  if printf '%s' "$interface_data" | grep -qi '^[[:space:]]*interface, name = '; then
+    printf '%s\n' "$interface_data" | awk -v wanted="$opkgtun_desc" '
+      function trim(value) {
+        gsub(/^[[:space:]]+|[[:space:]:]+$/, "", value)
+        return value
+      }
+      function flush() {
+        if (desc == wanted && iface ~ /^OpkgTun[0-9]+$/) {
+          print iface
+          exit
+        }
+      }
+      tolower($0) ~ /^[[:space:]]*interface, name = / {
+        flush()
+        iface = $0
+        sub(/^[[:space:]]*[Ii]nterface, name = "?/, "", iface)
+        sub(/[" ,:].*/, "", iface)
+        desc = ""
+        if (tolower($0) ~ /description[[:space:]]*=/) {
+          desc = $0
+          sub(/^.*description[[:space:]]*=[[:space:]]*/, "", desc)
+          desc = trim(desc)
+        }
+      }
+      /^[[:space:]]*interface-name:/ {
+        iface = $0
+        sub(/.*:[[:space:]]*/, "", iface)
+      }
+      /^[[:space:]]*id:/ {
+        candidate = $0
+        sub(/.*:[[:space:]]*/, "", candidate)
+        if (candidate ~ /^OpkgTun[0-9]+$/) iface = candidate
+      }
+      /^[[:space:]]*description:/ {
+        desc = $0
+        sub(/.*:[[:space:]]*/, "", desc)
+        desc = trim(desc)
+      }
+      END { flush() }
+    '
+    return
+  fi
+
+  inface_list="$(printf '%s' "$interface_data" | "$JSONFILTER_BIN" -e '$.interface[*].id' 2>/dev/null | grep 'OpkgTun' | sort -u)"
+  for iface in $inface_list; do
+    description="$(printf '%s' "$interface_data" | "$JSONFILTER_BIN" -e "@.interface['$iface'].description" 2>/dev/null)"
+    [ "$description" = "$opkgtun_desc" ] && echo "$iface" && return 0
+  done
+  return 1
+}
+
+get_address_by_iface() {
+  local opkgtun_iface="${1:-}"
+  local interface_data
+
+  [ -n "$opkgtun_iface" ] || return 1
+  interface_data="$(get_interface_data)"
+
+  if printf '%s' "$interface_data" | grep -q '^Interface, name = '; then
+    printf '%s\n' "$interface_data" | awk -v wanted="$opkgtun_iface" '
+      function flush() {
+        if (iface == wanted && address != "") {
+          print address
+          exit
+        }
+      }
+      /^Interface, name = / {
+        flush()
+        iface = $0
+        sub(/^Interface, name = "/, "", iface)
+        sub(/".*/, "", iface)
+        address = ""
+      }
+      /^[[:space:]]*interface-name:/ {
+        iface = $0
+        sub(/.*:[[:space:]]*/, "", iface)
+      }
+      /^[[:space:]]*address:/ {
+        address = $0
+        sub(/.*:[[:space:]]*/, "", address)
+      }
+      END { flush() }
+    '
+    return
+  fi
+
+  printf '%s' "$interface_data" | "$JSONFILTER_BIN" -e "@.interface['$opkgtun_iface'].address" 2>/dev/null
+}
+
+get_policy_field() {
+  local field="${1:-}"
+  local policy_data policy_name_lower value=""
+
+  [ -n "$POLICY_NAME" ] || return 1
+  [ -n "$field" ] || return 1
+  policy_data="$(get_policy_data || true)"
+  policy_name_lower="$(printf '%s' "$POLICY_NAME" | tr '[:upper:]' '[:lower:]')"
+
+  if printf '%s' "$policy_data" | grep -qi '^[[:space:]]*policy, name = '; then
+    value="$(printf '%s\n' "$policy_data" | awk -v wanted="$policy_name_lower" -v field="$field" '
+      function trim(value) {
+        gsub(/^[[:space:]]+|[[:space:]:]+$/, "", value)
+        return value
+      }
+      function flush() {
+        if ((tolower(name) == wanted || tolower(desc) == wanted) && val != "") {
+          print val
+          exit
+        }
+      }
+      tolower($0) ~ /^[[:space:]]*policy, name = / {
+        flush()
+        name = $0
+        sub(/^[[:space:]]*[Pp]olicy, name = "?/, "", name)
+        sub(/[" ,:].*/, "", name)
+        desc = ""
+        val = ""
+        if (tolower($0) ~ /description[[:space:]]*=/) {
+          desc = $0
+          sub(/^.*description[[:space:]]*=[[:space:]]*/, "", desc)
+          desc = trim(desc)
+        }
+      }
+      /^[[:space:]]*description[[:space:]]*:/ {
+        desc = $0
+        sub(/.*:[[:space:]]*/, "", desc)
+        desc = trim(desc)
+      }
+      {
+        key = "^[[:space:]]*" field "[[:space:]]*:[[:space:]]*"
+        if ($0 ~ key) {
+          val = $0
+          sub(/.*:[[:space:]]*/, "", val)
+          val = trim(val)
+        }
+      }
+      END { flush() }
+    ')"
+  fi
+
+  [ -n "$value" ] || value="$(printf '%s' "$policy_data" | "$JSONFILTER_BIN" -e "@.policy['$POLICY_NAME'].$field" 2>/dev/null | head -n1)"
+  [ -n "$value" ] && echo "$value"
+}
+
+get_policy_mark() {
+  local mark
+
+  mark="$(get_policy_field mark || true)"
+  [ -n "$mark" ] || return 1
+  case "$mark" in
+    0x*) echo "$mark" ;;
+    *) echo "0x$mark" ;;
+  esac
+}
+
+get_table_by_mark() {
+  local mark="${1:-}"
+  local mark_dec=""
+
+  [ -n "$mark" ] || return 1
+  mark_dec="$(printf '%d' "$mark" 2>/dev/null || true)"
+  get_ip_rule_data | awk -v mark="$mark" -v mark_dec="$mark_dec" '
+    {
+      found = 0
+      for (i = 1; i <= NF; i++) {
+        value = $(i + 1)
+        sub(/\/.*/, "", value)
+        if ($i == "fwmark" && (value == mark || value == mark_dec)) found = 1
+        if (found && $i == "lookup" && $(i + 1) != "") {
+          print $(i + 1)
+          exit
+        }
+      }
+    }
+  '
+}
+
+get_single_policy_table_from_rules() {
+  get_ip_rule_data | awk '
+    function hex_to_dec(mark, i, c, n, out) {
+      sub(/\/.*/, "", mark)
+      if (mark !~ /^0x[0-9a-fA-F]+$/) return ""
+      if (mark ~ /^0xffff/i) return ""
+      mark = substr(mark, 3)
+      out = 0
+      for (i = 1; i <= length(mark); i++) {
+        c = substr(mark, i, 1)
+        n = index("0123456789abcdef", tolower(c)) - 1
+        out = out * 16 + n
+      }
+      return out
+    }
+    {
+      mark = ""
+      table = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i == "fwmark") mark = $(i + 1)
+        if ($i == "lookup") table = $(i + 1)
+      }
+      mark_dec = hex_to_dec(mark)
+      if (mark_dec != "" && table ~ /^[0-9]+$/ && table == mark_dec) {
+        if (seen[table]++ == 0) {
+          count++
+          candidate = table
+        }
+      }
+    }
+    END {
+      if (count == 1) print candidate
+    }
+  '
+}
+
+get_policy_table4() {
+  local table4 mark
+
+  if [ -n "${POLICY_TABLE4:-}" ]; then
+    echo "$POLICY_TABLE4"
+    return 0
+  fi
+
+  table4="$(get_policy_field table4 || true)"
+  [ -n "$table4" ] || table4="$(get_policy_field table || true)"
+  [ -n "$table4" ] && echo "$table4" && return 0
+
+  mark="$(get_policy_mark || true)"
+  if [ -n "$mark" ]; then
+    table4="$(get_table_by_mark "$mark" || true)"
+    [ -n "$table4" ] && echo "$table4" && return 0
+  fi
+
+  get_single_policy_table_from_rules
+}
+
+get_sing_tun_inbound_field() {
+  local field="${1:-}"
+  local value
+
+  [ -n "$field" ] || return 1
+  [ -f "$CONFIG" ] || return 1
+
+  value="$("$JSONFILTER_BIN" -i "$CONFIG" -e '@.inbounds[@.type="tun"].'"$field" 2>/dev/null | head -n1)"
+  [ -n "$value" ] && echo "$value"
+}
+
+get_config_field() {
+  local expr="${1:-}"
+
+  [ -n "$expr" ] || return 1
+  [ -f "$CONFIG" ] || return 1
+  "$JSONFILTER_BIN" -i "$CONFIG" -e "$expr" 2>/dev/null | head -n1
+}
+
+get_remote_rule_set_urls() {
+  [ -f "$CONFIG" ] || return 1
+  "$JSONFILTER_BIN" -i "$CONFIG" -e '@.route.rule_set[@.type="remote"].url' 2>/dev/null
+}
+
+count_nonempty_lines() {
+  awk 'NF { count++ } END { print count + 0 }'
+}
+
+get_clash_api_base() {
+  local controller
+
+  controller="$(get_config_field '@.experimental.clash_api.external_controller' || true)"
+  [ -n "$controller" ] || return 1
+  case "$controller" in
+    0.0.0.0:*) controller="127.0.0.1:${controller#0.0.0.0:}" ;;
+    http://0.0.0.0:*) controller="http://127.0.0.1:${controller#http://0.0.0.0:}" ;;
+    https://0.0.0.0:*) controller="https://127.0.0.1:${controller#https://0.0.0.0:}" ;;
+  esac
+  case "$controller" in
+    http://*|https://*) echo "$controller" ;;
+    *) echo "http://$controller" ;;
+  esac
+}
+
+get_clash_secret_header() {
+  local secret
+
+  secret="$(get_config_field '@.experimental.clash_api.secret' || true)"
+  [ -n "$secret" ] || return 1
+  printf 'Authorization: Bearer %s\n' "$secret"
+}
+
+get_singbox_log_file() {
+  local output
+
+  output="$(get_config_field '@.log.output' || true)"
+  [ -n "$output" ] || output="${RUNTIME_DIR}/sing-box.log"
+  printf '%s\n' "$output"
+}
+
+print_singbox_log_tail() {
+  local sing_log
+
+  sing_log="$(get_singbox_log_file)"
+  if [ -f "$sing_log" ]; then
+    warn "Recent sing-box log:"
+    tail -n 20 "$sing_log" >&2
+  else
+    warn "sing-box log was not found: $sing_log"
+  fi
+}
+
+get_cache_file_path() {
+  local cache_path
+
+  cache_path="$(get_config_field '@.experimental.cache_file.path' || true)"
+  [ -n "$cache_path" ] || return 1
+  case "$cache_path" in
+    /*) printf '%s\n' "$cache_path" ;;
+    *) printf '%s/%s\n' "$SINGBOX_WORK_DIR" "$cache_path" ;;
+  esac
+}
+
+singbox_log_has_cache_timeout() {
+  local sing_log
+
+  sing_log="$(get_singbox_log_file)"
+  [ -f "$sing_log" ] || return 1
+  grep -q 'initialize cache-file: timeout' "$sing_log"
+}
+
+clean_runtime_cache_file() {
+  local cache_path
+
+  cache_path="$(get_cache_file_path || true)"
+  [ -n "$cache_path" ] || return 1
+  case "$cache_path" in
+    /tmp/*) ;;
+    *) die "Refusing to remove non-runtime cache file: $cache_path" ;;
+  esac
+
+  rm -f "$cache_path" "${cache_path}-shm" "${cache_path}-wal" 2>/dev/null || true
+  ok "Runtime cache file removed: $cache_path"
+}
+
+check_settings() {
+  local address
+
+  require_command "$JSONFILTER_BIN"
+  [ -f "$SETTINGS" ] || die "Settings not found: $SETTINGS"
+  "$JSONFILTER_BIN" -i "$SETTINGS" -e '@' >/dev/null 2>&1 || die "Settings JSON is invalid: $SETTINGS"
+  load_settings
+
+  [ -n "$POLICY_NAME" ] || die "policy.name must be set"
+  case "$POLICY_TABLE4" in
+    ""|*[!0-9]*) [ -z "$POLICY_TABLE4" ] || die "policy.table4 must be numeric when set" ;;
+  esac
+  [ -n "$TUN_NAME" ] || die "tun.name must be set"
+  case "$TUN_NAME" in
+    *[!A-Za-z0-9_-]*) die "tun.name allows only A-Z, a-z, 0-9, _ and -" ;;
+  esac
+  case "$TUN_INTERFACE_NAME" in
+    opkgtun[0-9]*) ;;
+    *) die "tun.interface_name must look like opkgtun0" ;;
+  esac
+  case "$TUN_TXQUEUELEN" in
+    ""|*[!0-9]*) die "tun.txqueuelen must be numeric" ;;
+  esac
+  case "$SINGBOX_VERSION_SETTING" in
+    ""|[0-9]*.[0-9]*.[0-9]*) ;;
+    *) die "singbox.version must look like 1.13.20 when set" ;;
+  esac
+
+  address="${TUN_ADDRESS%%/*}"
+  is_valid_ipv4 "$address" || die "Invalid tun.address: $TUN_ADDRESS"
+}
+
+set_txqueuelen_setting() {
+  local value="${1:-}"
+  local tmp_settings
+
+  require_command "$JSONFILTER_BIN"
+  [ -f "$SETTINGS" ] || die "Settings not found: $SETTINGS"
+  case "$value" in
+    ""|*[!0-9]*) die "txqueuelen value must be numeric" ;;
+  esac
+
+  mkdir -p "$TMP_DIR" || die "Failed to create temporary directory: $TMP_DIR"
+  tmp_settings="${TMP_DIR}/settings.json.$$"
+  awk -v value="$value" '
+    !done && /^[[:space:]]*"txqueuelen"[[:space:]]*:/ {
+      sub(/"txqueuelen"[[:space:]]*:[[:space:]]*[^,}]*/, "\"txqueuelen\": " value)
+      done = 1
+    }
+    { print }
+    END { if (!done) exit 2 }
+  ' "$SETTINGS" >"$tmp_settings" || {
+    rm -f "$tmp_settings" 2>/dev/null || true
+    die "Failed to update tun.txqueuelen in $SETTINGS"
+  }
+  "$JSONFILTER_BIN" -i "$tmp_settings" -e '@' >/dev/null 2>&1 || {
+    rm -f "$tmp_settings" 2>/dev/null || true
+    die "Updated settings JSON is invalid"
+  }
+
+  backup_file "$SETTINGS"
+  mv -f "$tmp_settings" "$SETTINGS" || die "Failed to replace $SETTINGS"
+  ok "Updated tun.txqueuelen=$value in $SETTINGS"
+
+  load_settings
+  if [ "$value" -gt 0 ] 2>/dev/null; then
+    run_cmd "$IP_BIN" link set dev "$TUN_INTERFACE_NAME" txqueuelen "$value" >/dev/null ||
+      die "Failed to apply txqueuelen=$value for $TUN_INTERFACE_NAME"
+    ok "Applied txqueuelen=$value for $TUN_INTERFACE_NAME"
+  else
+    info "txqueuelen=0 means keen-singbox will not change the current interface queue"
+  fi
+}
+
+validate_config_file() {
+  local inbound_addr inbound_iface auto_route policy_table4 address
+
+  check_settings
+  [ -f "$CONFIG" ] || die "sing-box config not found: $CONFIG"
+  "$JSONFILTER_BIN" -i "$CONFIG" -e '@' >/dev/null 2>&1 || die "sing-box config JSON is invalid: $CONFIG"
+  [ -x "$SINGBOX_BIN" ] || die "sing-box binary not found or not executable: $SINGBOX_BIN"
+  "$SINGBOX_BIN" check -c "$CONFIG" >/dev/null || die "sing-box config check failed: $CONFIG"
+
+  inbound_iface="$(get_sing_tun_inbound_field interface_name || true)"
+  [ "$inbound_iface" = "$TUN_INTERFACE_NAME" ] ||
+    die "sing-box tun interface_name '$inbound_iface' does not match settings '$TUN_INTERFACE_NAME'"
+
+  inbound_addr="$(get_sing_tun_inbound_field address || true)"
+  [ "$inbound_addr" = "$TUN_ADDRESS" ] ||
+    die "sing-box tun address '$inbound_addr' does not match settings '$TUN_ADDRESS'"
+
+  auto_route="$(get_sing_tun_inbound_field auto_route || true)"
+  [ "$auto_route" != "true" ] && [ "$auto_route" != "1" ] ||
+    die "Managed OpkgTun requires sing-box auto_route=false"
+
+  policy_table4="$(get_policy_table4 || true)"
+  [ -n "$policy_table4" ] || die "Connection policy '$POLICY_NAME' table was not found; set policy.table4"
+
+  address="${TUN_ADDRESS%%/*}"
+  validate_opkgtun_binding
+  check_ip_conflict "$address"
+  ok "Configuration is valid"
+}
+
+validate_opkgtun_binding() {
+  local expected_iface iface_by_desc description
+
+  expected_iface="$(expected_opkgtun_iface)" ||
+    die "Failed to derive OpkgTun interface from tun.interface_name=$TUN_INTERFACE_NAME"
+  iface_by_desc="$(get_iface_by_name "$TUN_NAME" || true)"
+  if [ -n "$iface_by_desc" ] && [ "$iface_by_desc" != "$expected_iface" ]; then
+    die "tun.name '$TUN_NAME' is bound to $iface_by_desc, but tun.interface_name '$TUN_INTERFACE_NAME' requires $expected_iface"
+  fi
+
+  description="$(get_iface_description "$expected_iface" || true)"
+  if [ -n "$description" ] && [ "$description" != "$TUN_NAME" ]; then
+    die "$expected_iface already exists with description '$description', expected '$TUN_NAME'. Change tun.interface_name or tun.name."
+  fi
+}
+
+check_ip_conflict() {
+  local wanted="${1:-}"
+  local expected_iface interface_data existing
+  local iface
+
+  [ -n "$wanted" ] || return 1
+  expected_iface="$(expected_opkgtun_iface || true)"
+  interface_data="$(get_interface_data || true)"
+  existing="$(printf '%s\n' "$interface_data" | awk -v ip="$wanted" '
+    /^[[:space:]]*address:/ {
+      address = $0
+      sub(/.*:[[:space:]]*/, "", address)
+      if (address == ip) print address
+    }
+  ' | head -n1)"
+  if [ -n "$existing" ]; then
+    iface="$(get_iface_by_name "$TUN_NAME" || true)"
+    [ -n "$iface" ] && [ "$(get_address_by_iface "$iface" || true)" = "$wanted" ] && return 0
+    [ -n "$expected_iface" ] && [ "$(get_address_by_iface "$expected_iface" || true)" = "$wanted" ] && return 0
+    die "IP address '$wanted' is already used by another interface"
+  fi
+}
+
+create_opkgtun() {
+  local address="${1:-}"
+  local opkgtun_name description
+
+  opkgtun_name="$(expected_opkgtun_iface)" ||
+    die "Failed to derive OpkgTun interface from tun.interface_name=$TUN_INTERFACE_NAME"
+  description="$(get_iface_description "$opkgtun_name" || true)"
+  if [ -n "$description" ] && [ "$description" != "$TUN_NAME" ]; then
+    die "$opkgtun_name already exists with description '$description', expected '$TUN_NAME'. Change tun.interface_name or tun.name."
+  fi
+
+  run_cmd "$NDMC_BIN" -c interface "$opkgtun_name" >/dev/null ||
+    die "Failed to create interface $opkgtun_name"
+  run_cmd "$NDMC_BIN" -c interface "$opkgtun_name" description "$TUN_NAME" >/dev/null ||
+    die "Failed to set description for $opkgtun_name"
+  run_cmd "$NDMC_BIN" -c interface "$opkgtun_name" ip address "${address}/32" >/dev/null ||
+    die "Failed to set IP address for $opkgtun_name"
+  run_cmd "$NDMC_BIN" -c interface "$opkgtun_name" ip tcp adjust-mss pmtu >/dev/null ||
+    die "Failed to set TCP MSS adjustment for $opkgtun_name"
+  run_cmd "$NDMC_BIN" -c ip route default "$address" "$opkgtun_name" >/dev/null ||
+    die "Failed to set default route candidate for $opkgtun_name"
+  run_cmd "$NDMC_BIN" -c interface "$opkgtun_name" ip global auto >/dev/null ||
+    die "Failed to set ip global auto for $opkgtun_name"
+  run_cmd "$NDMC_BIN" -c interface "$opkgtun_name" up >/dev/null ||
+    die "Failed to bring up $opkgtun_name"
+  reset_interface_cache
+  run_cmd "$NDMC_BIN" -c system configuration save >/dev/null 2>&1 || true
+
+  ok "OpkgTun '$TUN_NAME' created as $opkgtun_name"
+  echo "$opkgtun_name"
+}
+
+ensure_link_up() {
+  local opkgtun_iface="${1:-}"
+
+  run_cmd "$NDMC_BIN" -c interface "$opkgtun_iface" ip global auto >/dev/null ||
+    die "Failed to set ip global auto for $opkgtun_iface"
+  run_cmd "$NDMC_BIN" -c interface "$opkgtun_iface" up >/dev/null ||
+    die "Failed to bring up $opkgtun_iface"
+  reset_interface_cache
+  run_cmd "$IP_BIN" link set dev "$TUN_INTERFACE_NAME" up >/dev/null 2>&1 || true
+  if [ "$TUN_TXQUEUELEN" -gt 0 ] 2>/dev/null; then
+    run_cmd "$IP_BIN" link set dev "$TUN_INTERFACE_NAME" txqueuelen "$TUN_TXQUEUELEN" >/dev/null ||
+      die "Failed to set txqueuelen=$TUN_TXQUEUELEN for $TUN_INTERFACE_NAME"
+  fi
+}
+
+wait_link_ready() {
+  local timeout="${1:-20}"
+  local link_info
+
+  [ "$DRY_RUN" = "1" ] && return 0
+  while [ "$timeout" -gt 0 ]; do
+    link_info="$("$IP_BIN" link show dev "$TUN_INTERFACE_NAME" 2>/dev/null || true)"
+    [ -n "$link_info" ] && ! printf '%s' "$link_info" | grep -q 'state DOWN' && return 0
+    if ! is_running; then
+      print_singbox_log_tail
+      singbox_log_has_cache_timeout && return 2
+      die "sing-box exited before $TUN_INTERFACE_NAME became ready"
+    fi
+    sleep 1
+    timeout=$((timeout - 1))
+  done
+
+  link_info="$("$IP_BIN" link show dev "$TUN_INTERFACE_NAME" 2>/dev/null || true)"
+  if [ -n "$link_info" ]; then
+    warn "Linux interface $TUN_INTERFACE_NAME exists but is still down: $link_info"
+    return 0
+  fi
+
+  print_singbox_log_tail
+  die "Linux interface $TUN_INTERFACE_NAME was not created"
+}
+
+ensure_policy_route() {
+  local table4 route_state route_problem
+
+  [ "$TUN_DEFAULT_ROUTE" = "1" ] || return 0
+  table4="$(get_policy_table4 || true)"
+  [ -n "$table4" ] || die "Connection policy '$POLICY_NAME' table was not found; set policy.table4"
+
+  flush_policy_default_routes "$table4"
+  run_cmd "$IP_BIN" route add default dev "$TUN_INTERFACE_NAME" table "$table4" metric 10 >/dev/null ||
+    die "Failed to set policy table $table4 default route via $TUN_INTERFACE_NAME"
+  reset_policy_cache
+  run_cmd "$IP_BIN" route flush cache >/dev/null 2>&1 || true
+  if [ "$DRY_RUN" != "1" ]; then
+    route_state="$("$IP_BIN" route show table "$table4" 2>/dev/null | grep '^default' || true)"
+    [ -n "$route_state" ] ||
+      die "Policy table $table4 default route was not installed"
+    route_problem="$(policy_route_problem "$route_state" || true)"
+    [ -z "$route_problem" ] ||
+      die "Policy table $table4 default route is still invalid: $route_problem"
+  fi
+  ok "Policy table $table4 default route uses $TUN_INTERFACE_NAME"
+}
+
+flush_policy_default_routes() {
+  local table4="${1:-}"
+  local count=0
+
+  [ -n "$table4" ] || return 1
+  if [ "$DRY_RUN" = "1" ]; then
+    run_cmd "$IP_BIN" route del default table "$table4" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  while "$IP_BIN" route show table "$table4" 2>/dev/null | grep -q '^default'; do
+    "$IP_BIN" route del default table "$table4" >/dev/null 2>&1 || break
+    count=$((count + 1))
+    [ "$count" -lt 16 ] || break
+  done
+}
+
+remove_policy_route() {
+  local table4
+
+  check_settings
+  table4="$(get_policy_table4 || true)"
+  [ -n "$table4" ] || return 0
+  flush_policy_tun_default_routes "$table4"
+  reset_policy_cache
+  run_cmd "$IP_BIN" route flush cache >/dev/null 2>&1 || true
+  ok "Policy table $table4 default route removed from $TUN_INTERFACE_NAME"
+}
+
+flush_policy_tun_default_routes() {
+  local table4="${1:-}"
+  local address count=0
+
+  [ -n "$table4" ] || return 1
+  address="${TUN_ADDRESS%%/*}"
+  if [ "$DRY_RUN" = "1" ]; then
+    run_cmd "$IP_BIN" route del default dev "$TUN_INTERFACE_NAME" table "$table4" >/dev/null 2>&1 || true
+    run_cmd "$IP_BIN" route del default via "$address" dev "$TUN_INTERFACE_NAME" table "$table4" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  while "$IP_BIN" route show table "$table4" 2>/dev/null | grep -q "^default .* dev $TUN_INTERFACE_NAME"; do
+    "$IP_BIN" route del default dev "$TUN_INTERFACE_NAME" table "$table4" >/dev/null 2>&1 ||
+      "$IP_BIN" route del default via "$address" dev "$TUN_INTERFACE_NAME" table "$table4" >/dev/null 2>&1 ||
+      break
+    count=$((count + 1))
+    [ "$count" -lt 16 ] || break
+  done
+}
+
+policy_route_problem() {
+  local route_state="${1:-}"
+  local address
+  local default_count
+
+  [ -n "$route_state" ] || return 0
+  address="${TUN_ADDRESS%%/*}"
+  default_count="$(printf '%s\n' "$route_state" | grep -c '^default' 2>/dev/null || true)"
+  [ "${default_count:-0}" -le 1 ] 2>/dev/null ||
+    echo "policy table has multiple default routes"
+  printf '%s\n' "$route_state" | grep -q "^default dev $TUN_INTERFACE_NAME " && return 1
+  printf '%s\n' "$route_state" | grep -q "^default via $address dev $TUN_INTERFACE_NAME " &&
+    echo "invalid gateway: policy table routes via its own TUN address $address"
+  printf '%s\n' "$route_state" | grep -q "^default .* dev $TUN_INTERFACE_NAME " ||
+    echo "policy table default route does not use $TUN_INTERFACE_NAME"
+}
+
+doctor_fix() {
+  local message="${1:-}"
+  local fix="${2:-}"
+
+  warn "$message"
+  [ -n "$fix" ] && info "Fix: $fix"
+}
+
+check_remote_rule_sets() {
+  local urls url_count cache_enabled cache_path sing_log failures
+
+  urls="$(get_remote_rule_set_urls || true)"
+  if [ -z "$urls" ]; then
+    info "Remote rule sets: not configured"
+    return 0
+  fi
+
+  url_count="$(printf '%s\n' "$urls" | count_nonempty_lines)"
+  ok "Remote rule sets configured: $url_count"
+
+  cache_enabled="$(get_config_field '@.experimental.cache_file.enabled' || true)"
+  if [ "$cache_enabled" = "true" ] || [ "$cache_enabled" = "1" ]; then
+    cache_path="$(get_cache_file_path || true)"
+    if [ -n "$cache_path" ] && [ -s "$cache_path" ]; then
+      ok "Remote rule-set cache exists: $cache_path"
+    elif [ -n "$cache_path" ] && [ -f "$cache_path" ]; then
+      doctor_fix "Remote rule-set cache file is empty: $cache_path" "keen-singbox restart"
+    elif [ -n "$cache_path" ]; then
+      doctor_fix "Remote rule-set cache file was not found: $cache_path" "keen-singbox restart"
+    else
+      doctor_fix "Remote rule-set cache path was not found" "set experimental.cache_file.path in $CONFIG"
+    fi
+  else
+    doctor_fix "Remote rule-set cache is disabled" "set experimental.cache_file.enabled=true in $CONFIG"
+  fi
+
+  sing_log="$(get_singbox_log_file)"
+  if [ -f "$sing_log" ]; then
+    failures="$(
+      tail -n 200 "$sing_log" 2>/dev/null |
+        grep -Ei 'rule[-_ ]?set|ruleset' |
+        grep -Ei 'fail|failed|error|timeout|refused|no such|not found' |
+        tail -n 5
+    )"
+    if [ -n "$failures" ]; then
+      doctor_fix "Recent sing-box log contains remote rule-set errors" "keen-singbox logs"
+      printf '%s\n' "$failures" | while IFS= read -r line; do
+        [ -n "$line" ] && info "Rule-set log: $line"
+      done
+    else
+      ok "No recent remote rule-set errors in sing-box log"
+    fi
+  else
+    doctor_fix "sing-box log was not found: $sing_log" "keen-singbox restart"
+  fi
+}
+
+ensure_iptables_rule() {
+  local table="${1:-}"
+
+  shift || return 1
+  "$IPTABLES_BIN" -w -t "$table" -C "$@" >/dev/null 2>&1 ||
+    run_cmd "$IPTABLES_BIN" -w -t "$table" -A "$@" >/dev/null ||
+    die "Failed to add iptables $table rule: $*"
+}
+
+ensure_tun_firewall_rules() {
+  [ "$FIREWALL_TUN_RULES_ENABLED" = "1" ] || return 0
+  if ! command -v "$IPTABLES_BIN" >/dev/null 2>&1; then
+    warn "iptables was not found; TUN firewall rules were not applied"
+    return 0
+  fi
+
+  run_cmd "$IPTABLES_BIN" -w -t filter -N "$CHAIN_TUN" >/dev/null 2>&1 || true
+  ensure_iptables_rule filter INPUT -i "$TUN_INTERFACE_NAME" -j "$CHAIN_TUN"
+  ensure_iptables_rule filter FORWARD -i "$TUN_INTERFACE_NAME" -j "$CHAIN_TUN"
+  ensure_iptables_rule filter FORWARD -o "$TUN_INTERFACE_NAME" -j "$CHAIN_TUN"
+  ensure_iptables_rule filter "$CHAIN_TUN" -i "$TUN_INTERFACE_NAME" -j ACCEPT
+  ensure_iptables_rule filter "$CHAIN_TUN" -o "$TUN_INTERFACE_NAME" -j ACCEPT
+  # Use a private chain for ownership; xt_comment may be absent after reboot.
+  run_cmd "$IPTABLES_BIN" -w -t nat -N "$CHAIN_TUN_NAT" >/dev/null 2>&1 || true
+  ensure_iptables_rule nat "$CHAIN_TUN_NAT" -o "$TUN_INTERFACE_NAME" -j MASQUERADE
+  ensure_iptables_rule nat POSTROUTING -o "$TUN_INTERFACE_NAME" -j "$CHAIN_TUN_NAT"
+  # Migrate the old tagged rule only after its replacement is installed.
+  remove_legacy_tun_nat_rule
+  ok "TUN firewall rules are applied for $TUN_INTERFACE_NAME"
+}
+
+remove_legacy_tun_nat_rule() {
+  run_cmd "$IPTABLES_BIN" -w -t nat -D POSTROUTING -o "$TUN_INTERFACE_NAME" -j MASQUERADE -m comment --comment "$CHAIN_TUN" >/dev/null 2>&1 || true
+}
+
+write_firewall_hook_content() {
+  cat <<EOF
+#!/bin/sh
+# keen-singbox OpkgTun firewall hook.
+
+hook_type="\${type:-\${2:-}}"
+hook_table="\${table:-\${1:-}}"
+
+[ "\$hook_type" = "iptables" ] || exit 0
+case "\$hook_table" in
+  filter|nat) ;;
+  *) exit 0 ;;
+esac
+
+$SELF_BIN __hook-firewall >/dev/null 2>&1 || true
+EOF
+}
+
+install_firewall_hook() {
+  local tmp_hook
+
+  [ "$FIREWALL_TUN_RULES_ENABLED" = "1" ] || return 0
+  if ! command -v "$IPTABLES_BIN" >/dev/null 2>&1; then
+    warn "iptables was not found; TUN firewall hook was not installed"
+    return 0
+  fi
+
+  mkdir -p "$NETFILTER_DIR" "$TMP_DIR" || die "Failed to create firewall hook directories"
+  tmp_hook="${TMP_DIR}/keen-singbox-firewall.sh"
+  write_firewall_hook_content >"$tmp_hook" || die "Failed to write temporary firewall hook"
+  chmod 755 "$tmp_hook" || die "Failed to chmod temporary firewall hook"
+
+  if [ -f "$FIREWALL_HOOK" ] && cmp -s "$tmp_hook" "$FIREWALL_HOOK"; then
+    rm -f "$tmp_hook" 2>/dev/null || true
+    ok "TUN firewall hook is installed: $FIREWALL_HOOK"
+    return 0
+  fi
+
+  cp -f "$tmp_hook" "$FIREWALL_HOOK" || die "Failed to install firewall hook: $FIREWALL_HOOK"
+  chmod 755 "$FIREWALL_HOOK" || die "Failed to chmod firewall hook: $FIREWALL_HOOK"
+  rm -f "$tmp_hook" 2>/dev/null || true
+  ok "TUN firewall hook installed: $FIREWALL_HOOK"
+}
+
+remove_firewall_hook() {
+  [ -f "$FIREWALL_HOOK" ] || return 0
+  rm -f "$FIREWALL_HOOK" || die "Failed to remove firewall hook: $FIREWALL_HOOK"
+  ok "TUN firewall hook removed: $FIREWALL_HOOK"
+}
+
+remove_tun_firewall_rules() {
+  command -v "$IPTABLES_BIN" >/dev/null 2>&1 || return 0
+
+  run_cmd "$IPTABLES_BIN" -w -t nat -D POSTROUTING -o "$TUN_INTERFACE_NAME" -j "$CHAIN_TUN_NAT" >/dev/null 2>&1 || true
+  run_cmd "$IPTABLES_BIN" -w -t nat -F "$CHAIN_TUN_NAT" >/dev/null 2>&1 || true
+  run_cmd "$IPTABLES_BIN" -w -t nat -X "$CHAIN_TUN_NAT" >/dev/null 2>&1 || true
+  remove_legacy_tun_nat_rule
+  run_cmd "$IPTABLES_BIN" -w -t filter -D INPUT -i "$TUN_INTERFACE_NAME" -j "$CHAIN_TUN" >/dev/null 2>&1 || true
+  run_cmd "$IPTABLES_BIN" -w -t filter -D FORWARD -i "$TUN_INTERFACE_NAME" -j "$CHAIN_TUN" >/dev/null 2>&1 || true
+  run_cmd "$IPTABLES_BIN" -w -t filter -D FORWARD -o "$TUN_INTERFACE_NAME" -j "$CHAIN_TUN" >/dev/null 2>&1 || true
+  run_cmd "$IPTABLES_BIN" -w -t filter -F "$CHAIN_TUN" >/dev/null 2>&1 || true
+  run_cmd "$IPTABLES_BIN" -w -t filter -X "$CHAIN_TUN" >/dev/null 2>&1 || true
+  ok "TUN firewall rules are removed for $TUN_INTERFACE_NAME"
+}
+
+get_tun_firewall_status() {
+  [ "$FIREWALL_TUN_RULES_ENABLED" = "1" ] || {
+    echo "disabled"
+    return 0
+  }
+  command -v "$IPTABLES_BIN" >/dev/null 2>&1 || {
+    echo "iptables not found"
+    return 0
+  }
+  if "$IPTABLES_BIN" -w -t filter -C INPUT -i "$TUN_INTERFACE_NAME" -j "$CHAIN_TUN" >/dev/null 2>&1 &&
+    "$IPTABLES_BIN" -w -t filter -C FORWARD -i "$TUN_INTERFACE_NAME" -j "$CHAIN_TUN" >/dev/null 2>&1 &&
+    "$IPTABLES_BIN" -w -t filter -C FORWARD -o "$TUN_INTERFACE_NAME" -j "$CHAIN_TUN" >/dev/null 2>&1 &&
+    "$IPTABLES_BIN" -w -t filter -C "$CHAIN_TUN" -i "$TUN_INTERFACE_NAME" -j ACCEPT >/dev/null 2>&1 &&\
+    "$IPTABLES_BIN" -w -t filter -C "$CHAIN_TUN" -o "$TUN_INTERFACE_NAME" -j ACCEPT >/dev/null 2>&1 &&\
+    "$IPTABLES_BIN" -w -t nat -C POSTROUTING -o "$TUN_INTERFACE_NAME" -j "$CHAIN_TUN_NAT" >/dev/null 2>&1 &&\
+    "$IPTABLES_BIN" -w -t nat -C "$CHAIN_TUN_NAT" -o "$TUN_INTERFACE_NAME" -j MASQUERADE >/dev/null 2>&1; then
+    echo "applied"
+  else
+    echo "missing"
+  fi
+}
+
+get_tun_firewall_diagnostics() {
+  local nat_rules filter_rules details=""
+
+  command -v "$IPTABLES_BIN" >/dev/null 2>&1 || {
+    echo "iptables command not found"
+    return 0
+  }
+  nat_rules="$($IPTABLES_BIN -w -t nat -S 2>&1 || true)"
+  filter_rules="$($IPTABLES_BIN -w -t filter -S 2>&1 || true)"
+  printf '%s\n' "$nat_rules" | grep -q "keen_singbox_nat" ||
+    details="${details:+$details; }nat chain $CHAIN_TUN_NAT is missing"
+  printf '%s\n' "$nat_rules" | grep -q "MASQUERADE" ||
+    details="${details:+$details; }MASQUERADE target is unavailable or not configured"
+  printf '%s\n' "$filter_rules" | grep -q "keen_singbox_tun" ||
+    details="${details:+$details; }filter chain $CHAIN_TUN is missing"
+  [ -n "$details" ] && printf '%s\n' "$details" || printf 'iptables chains and MASQUERADE target look available\n'
+}
+
+get_firewall_hook_status() {
+  [ "$FIREWALL_TUN_RULES_ENABLED" = "1" ] || {
+    echo "disabled"
+    return 0
+  }
+  [ -f "$FIREWALL_HOOK" ] || {
+    echo "missing"
+    return 0
+  }
+  [ -x "$FIREWALL_HOOK" ] && echo "installed" || echo "not executable"
+}
+
+is_running() {
+  local pid
+
+  [ -f "$PID_FILE" ] || return 1
+  [ "$DRY_RUN" = "1" ] && return 1
+  pid="$(sed -n '1p' "$PID_FILE" 2>/dev/null)"
+  case "$pid" in
+    ""|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ "${KEEN_SINGBOX_PID_STRICT:-1}" = "0" ] && return 0
+  pid_matches_singbox "$pid"
+}
+
+pid_matches_singbox() {
+  local pid="${1:-}"
+  local cmdline
+
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  cmdline="$(tr '\000' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+  case "$cmdline" in
+    *"$SINGBOX_BIN"*|*"sing-box"*) return 0 ;;
+  esac
+  return 1
+}
+
+shell_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+write_singbox_runner() {
+  local sing_log="${1:-}"
+
+  mkdir -p "$(dirname "$RUNNER_SCRIPT")" "$(dirname "$sing_log")" || die "Failed to create runtime runner directories"
+  {
+    printf '%s\n' '#!/bin/sh'
+    printf 'exec %s run -D %s -c %s >>%s 2>&1\n' \
+      "$(shell_quote "$SINGBOX_BIN")" \
+      "$(shell_quote "$SINGBOX_WORK_DIR")" \
+      "$(shell_quote "$CONFIG")" \
+      "$(shell_quote "$sing_log")"
+  } >"$RUNNER_SCRIPT" || die "Failed to write sing-box runner: $RUNNER_SCRIPT"
+  chmod 755 "$RUNNER_SCRIPT" || die "Failed to chmod sing-box runner: $RUNNER_SCRIPT"
+}
+
+start_singbox() {
+  local sing_log
+
+  mkdir -p "$RUNTIME_DIR" "$(dirname "$PID_FILE")" 2>/dev/null || true
+  if is_running; then
+    ok "sing-box is already running"
+    return 0
+  fi
+  rm -f "$PID_FILE" 2>/dev/null || true
+  sing_log="$(get_singbox_log_file)"
+  mkdir -p "$(dirname "$sing_log")" 2>/dev/null || true
+  rotate_log_file "$sing_log"
+  : >"$sing_log" 2>/dev/null || true
+  write_singbox_runner "$sing_log"
+  run_cmd start-stop-daemon -S -b -m -p "$PID_FILE" -x "$RUNNER_SCRIPT" ||
+    die "Failed to start sing-box"
+  if [ "$DRY_RUN" != "1" ]; then
+    sleep 2
+    if ! is_running; then
+      print_singbox_log_tail
+      singbox_log_has_cache_timeout && return 2
+      die "sing-box exited immediately after start"
+    fi
+  fi
+  ok "sing-box started"
+}
+
+stop_singbox() {
+  check_settings
+  if ! is_running; then
+    rm -f "$PID_FILE" 2>/dev/null || true
+    ok "sing-box is already stopped"
+    return 0
+  fi
+  run_cmd start-stop-daemon -K -p "$PID_FILE" >/dev/null ||
+    die "Failed to stop sing-box"
+  rm -f "$PID_FILE" 2>/dev/null || true
+  ok "sing-box stopped"
+}
+
+start_service() {
+  local init_mode="${1:-}"
+  local address iface expected_iface iface_address
+  local wait_status start_status
+
+  check_settings
+  if [ "$init_mode" = "--init" ] && [ "$AUTO_START_ENABLED" != "1" ]; then
+    info "Autostart is disabled"
+    return 0
+  fi
+  if [ "$init_mode" = "--init" ] && [ "$AUTO_START_DELAY" -gt 0 ] 2>/dev/null; then
+    sleep "$AUTO_START_DELAY"
+  fi
+
+  validate_config_file
+  address="${TUN_ADDRESS%%/*}"
+  expected_iface="$(expected_opkgtun_iface)" ||
+    die "Failed to derive OpkgTun interface from tun.interface_name=$TUN_INTERFACE_NAME"
+  iface="$(get_iface_by_name "$TUN_NAME" || true)"
+  if [ -n "$iface" ] && [ "$iface" != "$expected_iface" ]; then
+    die "tun.name '$TUN_NAME' is bound to $iface, but tun.interface_name '$TUN_INTERFACE_NAME' requires $expected_iface"
+  fi
+  iface="$expected_iface"
+  [ -n "$(get_iface_description "$iface" || true)" ] || iface="$(create_opkgtun "$address" | tail -n1)"
+
+  iface_address="$(get_address_by_iface "$iface" || true)"
+  [ -z "$iface_address" ] || [ "$iface_address" = "$address" ] ||
+    die "OpkgTun '$TUN_NAME' has IP '$iface_address', expected '$address'"
+
+  ensure_link_up "$iface"
+  start_singbox || {
+    start_status=$?
+    if [ "$start_status" -eq 2 ]; then
+      clean_runtime_cache_file
+      start_singbox
+    else
+      return "$start_status"
+    fi
+  }
+  wait_link_ready "$TUN_WAIT_LINK_SECONDS" || {
+    wait_status=$?
+    if [ "$wait_status" -eq 2 ]; then
+      clean_runtime_cache_file
+      start_singbox
+      wait_link_ready "$TUN_WAIT_LINK_SECONDS"
+    else
+      return "$wait_status"
+    fi
+  }
+  install_firewall_hook
+  ensure_tun_firewall_rules
+  ensure_policy_route
+  route_recheck
+  ok "Service startup completed"
+}
+
+route_recheck() {
+  local delay="${KEEN_SINGBOX_ROUTE_RECHECK_SECONDS:-2}"
+
+  [ "$TUN_DEFAULT_ROUTE" = "1" ] || return 0
+  [ "$DRY_RUN" = "1" ] && return 0
+  case "$delay" in
+    ""|*[!0-9]*) delay=2 ;;
+  esac
+  [ "$delay" -gt 0 ] 2>/dev/null && sleep "$delay"
+  ensure_policy_route
+}
+
+reload_service() {
+  validate_config_file
+  if is_running; then
+    restart_service
+  else
+    start_service
+  fi
+}
+
+restart_service() {
+  stop_service
+  start_service
+}
+
+stop_service() {
+  remove_policy_route
+  remove_firewall_hook
+  remove_tun_firewall_rules
+  stop_singbox
+}
+
+install_dependencies() {
+  local pkg pkg_list missing=""
+
+  command -v opkg >/dev/null 2>&1 || die "Entware opkg was not found"
+  pkg_list="$(opkg list-installed 2>/dev/null | awk '{print $1}')"
+  for pkg in $DEPENDENCIES; do
+    if command -v "$pkg" >/dev/null 2>&1 || printf '%s\n' "$pkg_list" | grep -qx "$pkg"; then
+      continue
+    fi
+    missing="${missing:+$missing }$pkg"
+  done
+  if [ -n "$missing" ]; then
+    run_cmd opkg update >/dev/null || die "opkg update failed"
+    # shellcheck disable=SC2086
+    run_cmd opkg install $missing >/dev/null || die "Failed to install dependencies: $missing"
+  fi
+  ok "Dependencies are installed"
+}
+
+arch_elf() {
+  local bin="/opt/bin/opkg"
+  local base="mips"
+  local b5 b6
+
+  b5="$(hexdump -s 4 -n 1 -e '1/1 "%d"' "$bin" 2>/dev/null)"
+  b6="$(hexdump -s 5 -n 1 -e '1/1 "%d"' "$bin" 2>/dev/null)"
+  [ -z "$b5" ] || [ -z "$b6" ] && echo "" && return
+  [ "$b5" -eq 2 ] && base="${base}64"
+  [ "$b6" -eq 1 ] && base="${base}el"
+  echo "$base"
+}
+
+get_architecture() {
+  local opkg_arch arch cpu_info
+
+  opkg_arch="$(opkg print-architecture 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  case "$opkg_arch" in
+    *aarch64*|*arm64*|*armv8*) arch="aarch64" ;;
+    *mips*) arch="$(arch_elf)" ;;
+    *) arch="" ;;
+  esac
+  [ -n "$arch" ] || die "Unsupported CPU architecture"
+
+  cpu_info="$(tr '[:upper:]' '[:lower:]' </proc/cpuinfo | tr -d '[:space:]')"
+  case "$arch" in
+    aarch64)
+      case "$cpu_info" in
+        *0xd03*) PKG_ARCH="${arch}_cortex-a53" ;;
+        *0xd08*) PKG_ARCH="${arch}_cortex-a72" ;;
+        *0xd0b*) PKG_ARCH="${arch}_cortex-a76" ;;
+        *) PKG_ARCH="${arch}_generic" ;;
+      esac
+      ;;
+    mipsel)
+      case "$cpu_info" in
+        *74k*) PKG_ARCH="${arch}_74kc" ;;
+        *24kf*|*fpu:yes*|*fpuexception:yes*) PKG_ARCH="${arch}_24kc_24kf" ;;
+        *24k*|*34k*|*1004k*|*interaptiv*) PKG_ARCH="${arch}_24kc" ;;
+        *) PKG_ARCH="${arch}_mips32" ;;
+      esac
+      ;;
+    mips) PKG_ARCH="${arch}_24kc" ;;
+    mips64el) PKG_ARCH="${arch}_mips64r2" ;;
+    mips64) PKG_ARCH="${arch}_mips64r2" ;;
+  esac
+}
+
+get_latest_version() {
+  curl -fsSL \
+    --connect-timeout "${SINGBOX_CONNECT_TIMEOUT:-15}" \
+    --max-time "${SINGBOX_DOWNLOAD_MAX_TIME:-60}" \
+    --retry "${SINGBOX_DOWNLOAD_RETRIES:-2}" \
+    "$SINGBOX_API_URL" | "$JSONFILTER_BIN" -e '@.tag_name' | sed 's/^v//'
+}
+
+download_file() {
+  local output="${1:-}"
+  local url="${2:-}"
+
+  [ -n "$output" ] || return 1
+  [ -n "$url" ] || return 1
+
+  info "Trying $url"
+  curl -fsSL \
+    --connect-timeout "${SINGBOX_CONNECT_TIMEOUT:-15}" \
+    --max-time "${SINGBOX_DOWNLOAD_MAX_TIME:-180}" \
+    --retry "${SINGBOX_DOWNLOAD_RETRIES:-2}" \
+    --retry-delay 2 \
+    -o "$output" \
+    "$url"
+}
+
+download_singbox_package() {
+  local output="${1:-}"
+  local version="${2:-}"
+  local pkg_name="${3:-}"
+  local url
+
+  if [ -n "${SINGBOX_PACKAGE:-}" ]; then
+    [ -f "$SINGBOX_PACKAGE" ] || die "SINGBOX_PACKAGE does not exist: $SINGBOX_PACKAGE"
+    cp -f "$SINGBOX_PACKAGE" "$output" || die "Failed to copy $SINGBOX_PACKAGE"
+    ok "Using local sing-box package: $SINGBOX_PACKAGE"
+    return 0
+  fi
+
+  if [ -n "${SINGBOX_URL:-}" ]; then
+    download_file "$output" "$SINGBOX_URL" && return 0
+    die "Failed to download SINGBOX_URL: $SINGBOX_URL"
+  fi
+
+  for url in \
+    "${SINGBOX_MIRROR_BASE:-https://sourceforge.net/projects/sing-box.mirror/files}/v${version}/${pkg_name}/download" \
+    "https://dl.sing-box.org/releases/v${version}/${pkg_name}" \
+    "https://github.com/SagerNet/sing-box/releases/download/v${version}/${pkg_name}" \
+    "https://github.com/SagerNet/sing-box/releases/download/v${version}/${pkg_name}?download="; do
+    download_file "$output" "$url" && return 0
+    warn "Download failed: $url"
+  done
+
+  die "Failed to download $pkg_name. Set SINGBOX_URL=<url> or copy an .ipk to the router and set SINGBOX_PACKAGE=<path>."
+}
+
+install_singbox() {
+  local version pkg_name package_path unpack_dir new_bin backup
+
+  install_dependencies
+  get_architecture
+  version="${SINGBOX_VERSION:-${SINGBOX_VERSION_SETTING:-}}"
+  [ -n "$version" ] || version="$(get_latest_version)"
+  [ -n "$version" ] || die "Failed to determine latest sing-box version"
+
+  pkg_name="sing-box_${version}_openwrt_${PKG_ARCH}.ipk"
+  package_path="${TMP_DIR}/${pkg_name}"
+  unpack_dir="${TMP_DIR}/sing-box-unpack"
+  mkdir -p "$TMP_DIR" "$unpack_dir" || die "Failed to create runtime temp directory"
+  rm -rf "$unpack_dir"
+  mkdir -p "$unpack_dir"
+
+  info "Preparing $pkg_name"
+  download_singbox_package "$package_path" "$version" "$pkg_name"
+
+  cd "$unpack_dir" || die "Failed to enter $unpack_dir"
+  tar -xzf "$package_path" && tar -xzf data.tar.gz ||
+    die "Failed to unpack $pkg_name"
+  [ -f ./usr/bin/sing-box ] || die "sing-box binary not found inside package"
+
+  new_bin="${SINGBOX_BIN}.new"
+  backup="${SINGBOX_BIN}.bak"
+  mkdir -p "$(dirname "$SINGBOX_BIN")" || die "Failed to create binary directory"
+  cp -f ./usr/bin/sing-box "$new_bin" || die "Failed to stage sing-box binary"
+  chmod 755 "$new_bin" || die "Failed to chmod staged sing-box binary"
+  [ -f "$SINGBOX_BIN" ] && cp -fp "$SINGBOX_BIN" "$backup" 2>/dev/null || true
+  mv -f "$new_bin" "$SINGBOX_BIN" || die "Failed to install $SINGBOX_BIN"
+  rm -rf "$unpack_dir" "$package_path" 2>/dev/null || true
+  ok "sing-box installed: $SINGBOX_BIN"
+}
+
+format_bytes() {
+  local bytes="${1:-0}"
+
+  case "$bytes" in
+    ""|*[!0-9]*) bytes=0 ;;
+  esac
+
+  if [ "$bytes" -ge 1048576 ] 2>/dev/null; then
+    awk -v bytes="$bytes" 'BEGIN { printf "%.2f MiB", bytes / 1048576 }'
+  elif [ "$bytes" -ge 1024 ] 2>/dev/null; then
+    awk -v bytes="$bytes" 'BEGIN { printf "%.2f KiB", bytes / 1024 }'
+  else
+    printf '%s B' "$bytes"
+  fi
+}
+
+get_core_version() {
+  [ -x "$SINGBOX_BIN" ] || return 1
+  "$SINGBOX_BIN" version 2>/dev/null |
+    sed -n 's/.*version[[:space:]]\{1,\}\([0-9][0-9.]*\).*/\1/p' |
+    head -n1
+}
+
+read_iface_counter() {
+  local counter="${1:-}"
+  local path="/sys/class/net/${TUN_INTERFACE_NAME}/statistics/${counter}"
+
+  [ -f "$path" ] || return 1
+  sed -n '1p' "$path" 2>/dev/null
+}
+
+get_iface_traffic_sample() {
+  local rx1 tx1 rx2 tx2 rx_rate tx_rate
+
+  rx1="$(read_iface_counter rx_bytes || true)"
+  tx1="$(read_iface_counter tx_bytes || true)"
+  [ -n "$rx1" ] && [ -n "$tx1" ] || return 1
+  sleep "${KEEN_SINGBOX_STATUS_SAMPLE_SECONDS:-1}"
+  rx2="$(read_iface_counter rx_bytes || true)"
+  tx2="$(read_iface_counter tx_bytes || true)"
+  [ -n "$rx2" ] && [ -n "$tx2" ] || return 1
+
+  rx_rate=$((rx2 - rx1))
+  tx_rate=$((tx2 - tx1))
+  [ "$rx_rate" -lt 0 ] 2>/dev/null && rx_rate=0
+  [ "$tx_rate" -lt 0 ] 2>/dev/null && tx_rate=0
+
+  printf 'RX %s/s TX %s/s, total RX %s TX %s\n' \
+    "$(format_bytes "$rx_rate")" \
+    "$(format_bytes "$tx_rate")" \
+    "$(format_bytes "$rx2")" \
+    "$(format_bytes "$tx2")"
+}
+
+get_iface_txqueuelen() {
+  "$IP_BIN" link show dev "$TUN_INTERFACE_NAME" 2>/dev/null |
+    awk '{
+      for (i = 1; i <= NF; i++) {
+        if ($i == "qlen" && $(i + 1) != "") {
+          print $(i + 1)
+          exit
+        }
+      }
+    }'
+}
+
+get_proxy_status() {
+  local api_base secret_header response now delay history_count
+
+  api_base="$(get_clash_api_base || true)"
+  [ -n "$api_base" ] || return 1
+
+  secret_header="$(get_clash_secret_header || true)"
+  if [ -n "$secret_header" ]; then
+    response="$(curl -fsS --connect-timeout 2 --max-time 4 -H "$secret_header" "${api_base}/proxies/proxy" 2>/dev/null || true)"
+  else
+    response="$(curl -fsS --connect-timeout 2 --max-time 4 "${api_base}/proxies/proxy" 2>/dev/null || true)"
+  fi
+  [ -n "$response" ] || return 1
+
+  now="$(printf '%s' "$response" | "$JSONFILTER_BIN" -e '@.now' 2>/dev/null | head -n1)"
+  delay="$(printf '%s' "$response" | "$JSONFILTER_BIN" -e '@.history[-1].delay' 2>/dev/null | head -n1)"
+  history_count="$(printf '%s' "$response" | "$JSONFILTER_BIN" -e '@.history[*].delay' 2>/dev/null | wc -l | awk '{print $1}')"
+
+  if [ -n "$now" ]; then
+    printf 'tag=proxy selected=%s' "$now"
+    [ -n "$delay" ] && printf ' delay=%sms' "$delay"
+    [ "${history_count:-0}" -gt 0 ] 2>/dev/null && printf ' checks=%s' "$history_count"
+    printf '\n'
+    return 0
+  fi
+
+  return 1
+}
+
+find_template_dir() {
+  local src_dir candidate
+
+  src_dir="$(script_dir)"
+  for candidate in \
+    "$src_dir" \
+    "${src_dir}/../examples" \
+    "$PWD" \
+    "${PWD}/examples" \
+    "$TEMPLATE_DIR" \
+    "$WORK_DIR"; do
+    if [ -f "${candidate}/settings.default.json" ] &&
+      [ -f "${candidate}/config.default.json" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+install_profile_templates() {
+  local template_dir="${1:-}"
+  local profile
+
+  [ -n "$template_dir" ] || return 1
+  mkdir -p "$TEMPLATE_DIR" || die "Failed to create $TEMPLATE_DIR"
+  for profile in default lowmem; do
+    [ -f "${template_dir}/settings.${profile}.json" ] || continue
+    [ -f "${template_dir}/config.${profile}.json" ] || continue
+    cp -f "${template_dir}/settings.${profile}.json" "$TEMPLATE_DIR/" ||
+      die "Failed to install settings.${profile}.json template"
+    cp -f "${template_dir}/config.${profile}.json" "$TEMPLATE_DIR/" ||
+      die "Failed to install config.${profile}.json template"
+  done
+  ok "Profile templates installed: $TEMPLATE_DIR"
+}
+
+install_templates() {
+  local src_dir template_dir profile settings_template config_template
+
+  src_dir="$(script_dir)"
+  template_dir="$(find_template_dir)" || die "Profile templates were not found"
+  profile="${1:-${KEEN_SINGBOX_PROFILE:-default}}"
+  case "$profile" in
+    default|lowmem) ;;
+    *) die "Unsupported profile '$profile'. Use default or lowmem." ;;
+  esac
+  settings_template="${template_dir}/settings.${profile}.json"
+  config_template="${template_dir}/config.${profile}.json"
+  [ -f "$settings_template" ] || die "Missing settings template: $settings_template"
+  [ -f "$config_template" ] || die "Missing config template: $config_template"
+
+  mkdir -p "$WORK_DIR" "$BIN_DIR" "$INIT_DIR" "$RUNTIME_DIR" || die "Failed to create directories"
+  install_profile_templates "$template_dir"
+
+  if [ -f "$SETTINGS" ]; then
+    warn "Settings already exist, leaving unchanged: $SETTINGS"
+    cp -f "$settings_template" "${SETTINGS}.${profile}.example" || die "Failed to install settings example"
+  else
+    cp -f "$settings_template" "$SETTINGS" || die "Failed to install settings"
+    chmod 644 "$SETTINGS" 2>/dev/null || true
+  fi
+
+  if [ -f "$CONFIG" ]; then
+    warn "sing-box config already exists, leaving unchanged: $CONFIG"
+    cp -f "$config_template" "${CONFIG}.${profile}.example" || die "Failed to install config example"
+  else
+    cp -f "$config_template" "$CONFIG" || die "Failed to install config"
+    chmod 644 "$CONFIG" 2>/dev/null || true
+  fi
+
+  cp -f "${src_dir}/keen-singbox" "$SELF_BIN" || die "Failed to install $SELF_BIN"
+  chmod 755 "$SELF_BIN" || die "Failed to chmod $SELF_BIN"
+  ok "CLI installed: $SELF_BIN"
+  ok "Profile installed: $profile"
+}
+
+install_active_config() {
+  local template_dir profile settings_template config_template
+
+  template_dir="$(find_template_dir)" || die "Profile templates were not found. Run from the unpacked archive or run: keen-singbox install"
+  profile="${1:-${KEEN_SINGBOX_PROFILE:-default}}"
+  case "$profile" in
+    default|lowmem) ;;
+    *) die "Unsupported profile '$profile'. Use default or lowmem." ;;
+  esac
+  settings_template="${template_dir}/settings.${profile}.json"
+  config_template="${template_dir}/config.${profile}.json"
+  [ -f "$settings_template" ] || die "Missing settings template: $settings_template"
+  [ -f "$config_template" ] || die "Missing config template: $config_template"
+
+  mkdir -p "$WORK_DIR" || die "Failed to create $WORK_DIR"
+  replace_json_atomically "$settings_template" "$SETTINGS"
+  replace_json_atomically "$config_template" "$CONFIG"
+  ok "Active profile installed: $profile"
+  ok "Settings installed: $SETTINGS"
+  ok "Config installed: $CONFIG"
+}
+
+install_init() {
+  load_settings
+  mkdir -p "$INIT_DIR" || die "Failed to create $INIT_DIR"
+  cat >"$INIT_SCRIPT" <<EOF || die "Failed to write $INIT_SCRIPT"
+#!/bin/sh
+PATH=$PATH
+case "\${1:-start}" in
+  start)
+    mkdir -p $(shell_quote "$RUNTIME_DIR") || exit 1
+    exec $(shell_quote "$SELF_BIN") start --init >>$(shell_quote "$RUNTIME_DIR/init.log") 2>&1
+    ;;
+  stop|restart|reload|status)
+    exec $(shell_quote "$SELF_BIN") "\$1"
+    ;;
+  *) echo "Usage: \$0 {start|stop|restart|reload|status}" >&2; exit 1 ;;
+esac
+EOF
+  chmod 755 "$INIT_SCRIPT" || die "Failed to chmod $INIT_SCRIPT"
+  ok "Init script installed: $INIT_SCRIPT"
+}
+
+install_all() {
+  local profile="${1:-${KEEN_SINGBOX_PROFILE:-default}}"
+
+  command -v "$NDMC_BIN" >/dev/null 2>&1 || [ "$DRY_RUN" = "1" ] || die "ndmc was not found; run on KeeneticOS"
+  install_dependencies
+  install_templates "$profile"
+  install_init
+  if [ ! -x "$SINGBOX_BIN" ]; then
+    install_singbox
+  else
+    ok "sing-box binary already exists: $SINGBOX_BIN"
+  fi
+  info "Edit $CONFIG with real proxy outbounds, then run: keen-singbox validate"
+}
+
+status() {
+  local iface iface_address table4 route_state link_state version
+  local inbound_iface proxy_status traffic_sample firewall_status firewall_hook_status
+  local txqueuelen route_problem
+
+  check_settings
+  iface="$(get_iface_by_name "$TUN_NAME" || true)"
+  iface_address="$(get_address_by_iface "$iface" 2>/dev/null || true)"
+  table4="$(get_policy_table4 || true)"
+  [ -n "$table4" ] && route_state="$("$IP_BIN" route show table "$table4" 2>/dev/null | grep '^default' || true)" || route_state=""
+  route_problem="$(policy_route_problem "$route_state" || true)"
+  link_state="$("$IP_BIN" link show dev "$TUN_INTERFACE_NAME" 2>/dev/null | head -n1 || true)"
+  version="$(get_core_version || true)"
+  inbound_iface="$(get_sing_tun_inbound_field interface_name || true)"
+  proxy_status="$(get_proxy_status || true)"
+  traffic_sample="$(get_iface_traffic_sample || true)"
+  firewall_status="$(get_tun_firewall_status || true)"
+  firewall_hook_status="$(get_firewall_hook_status || true)"
+  txqueuelen="$(get_iface_txqueuelen || true)"
+
+  echo "Settings: $SETTINGS"
+  echo "Config: $CONFIG"
+  echo "Core: $SINGBOX_BIN"
+  echo "Core version: ${version:-not found}"
+  echo "Running: $(is_running && echo yes || echo no)"
+  echo "Policy: $POLICY_NAME"
+  echo "Policy table4: ${table4:-not found}"
+  echo "TUN name: $TUN_NAME"
+  echo "Keenetic interface: ${iface:-not found}"
+  echo "Linux interface: $TUN_INTERFACE_NAME"
+  echo "Sing-box TUN inbound: ${inbound_iface:-not found}"
+  echo "Link: ${link_state:-not found}"
+  echo "Address: ${iface_address:-$TUN_ADDRESS}"
+  echo "Default route: ${route_state:-not found}"
+  [ -z "$route_problem" ] || echo "Default route problem: $route_problem"
+  echo "VPN outbound: ${proxy_status:-not available}"
+  echo "Traffic: ${traffic_sample:-not available}"
+  echo "TUN txqueuelen: configured=$TUN_TXQUEUELEN current=${txqueuelen:-unknown}"
+  echo "TUN firewall: ${firewall_status:-unknown}"
+  echo "TUN firewall hook: ${firewall_hook_status:-unknown}"
+  echo "Runtime: $RUNTIME_DIR"
+}
+
+logs() {
+  check_settings
+  [ -f "$LOG_FILE" ] && tail -n 80 "$LOG_FILE"
+  [ -f "${RUNTIME_DIR}/sing-box.log" ] && tail -n 80 "${RUNTIME_DIR}/sing-box.log"
+}
+
+doctor() {
+  local table4 cache_path route_state route_problem link_state txqueuelen
+  local expected_iface iface iface_address inbound_iface inbound_addr auto_route
+  local firewall_status firewall_hook_status firewall_diagnostics core_version
+
+  check_settings
+  info "Configured policy.name: $POLICY_NAME"
+  if [ "$AUTO_START_ENABLED" = "1" ]; then
+    ok "Autostart is enabled (delay: ${AUTO_START_DELAY}s)"
+  else
+    doctor_fix "Autostart is disabled" "set auto_start.enabled=1 in $SETTINGS"
+  fi
+  [ -x "$INIT_SCRIPT" ] && ok "Autostart script is executable: $INIT_SCRIPT" ||
+    doctor_fix "Autostart script is missing or not executable: $INIT_SCRIPT" "keen-singbox install-init"
+  [ ! -f "$RUNTIME_DIR/init.log" ] || info "Autostart log: $RUNTIME_DIR/init.log"
+  for cmd in "$NDMC_BIN" "$JSONFILTER_BIN" "$IP_BIN" start-stop-daemon curl tar; do
+    command -v "$cmd" >/dev/null 2>&1 && ok "$cmd found" ||
+      doctor_fix "$cmd not found" "install dependencies: keen-singbox install"
+  done
+
+  [ -x "$SINGBOX_BIN" ] && ok "sing-box core found" ||
+    doctor_fix "sing-box core missing: $SINGBOX_BIN" "keen-singbox install-singbox"
+  core_version="$(get_core_version || true)"
+  if [ -n "$SINGBOX_VERSION_SETTING" ] && [ -n "$core_version" ]; then
+    [ "$core_version" = "$SINGBOX_VERSION_SETTING" ] &&
+      ok "sing-box version is pinned: $core_version" ||
+      doctor_fix "sing-box version '$core_version' differs from pinned '$SINGBOX_VERSION_SETTING'" "install sing-box version $SINGBOX_VERSION_SETTING"
+  elif [ -n "$SINGBOX_VERSION_SETTING" ]; then
+    doctor_fix "sing-box version could not be read" "keen-singbox install-singbox"
+  else
+    doctor_fix "sing-box version is not pinned in settings" "set singbox.version to the installed version in $SETTINGS"
+  fi
+  if [ -f "$CONFIG" ]; then
+    ok "sing-box config found"
+    "$JSONFILTER_BIN" -i "$CONFIG" -e '@' >/dev/null 2>&1 &&
+      ok "sing-box config JSON is valid" ||
+      doctor_fix "sing-box config JSON is invalid: $CONFIG" "repair JSON in $CONFIG"
+    if [ -x "$SINGBOX_BIN" ]; then
+      "$SINGBOX_BIN" check -c "$CONFIG" >/dev/null 2>&1 &&
+        ok "sing-box config check passed" ||
+        doctor_fix "sing-box config check failed" "keen-singbox validate"
+    fi
+  else
+    doctor_fix "sing-box config missing: $CONFIG" "keen-singbox install-config default"
+  fi
+
+  inbound_iface="$(get_sing_tun_inbound_field interface_name || true)"
+  [ "$inbound_iface" = "$TUN_INTERFACE_NAME" ] &&
+    ok "sing-box TUN interface matches settings: $TUN_INTERFACE_NAME" ||
+    doctor_fix "sing-box TUN interface '${inbound_iface:-not found}' does not match settings '$TUN_INTERFACE_NAME'" "set inbounds[].interface_name=$TUN_INTERFACE_NAME in $CONFIG"
+
+  inbound_addr="$(get_sing_tun_inbound_field address || true)"
+  [ "$inbound_addr" = "$TUN_ADDRESS" ] &&
+    ok "sing-box TUN address matches settings: $TUN_ADDRESS" ||
+    doctor_fix "sing-box TUN address '${inbound_addr:-not found}' does not match settings '$TUN_ADDRESS'" "set inbounds[].address=$TUN_ADDRESS in $CONFIG"
+
+  auto_route="$(get_sing_tun_inbound_field auto_route || true)"
+  [ "$auto_route" != "true" ] && [ "$auto_route" != "1" ] &&
+    ok "sing-box TUN auto_route is disabled" ||
+    doctor_fix "sing-box TUN auto_route must be false for managed OpkgTun" "set inbounds[].auto_route=false in $CONFIG"
+
+  expected_iface="$(expected_opkgtun_iface || true)"
+  if [ -n "$expected_iface" ]; then
+    ok "expected Keenetic interface: $expected_iface"
+    iface="$(get_iface_by_name "$TUN_NAME" || true)"
+    if [ -n "$iface" ]; then
+      [ "$iface" = "$expected_iface" ] &&
+        ok "TUN name '$TUN_NAME' is bound to $iface" ||
+        doctor_fix "TUN name '$TUN_NAME' is bound to $iface, expected $expected_iface" "change tun.name or tun.interface_name in $SETTINGS"
+    else
+      doctor_fix "Keenetic OpkgTun interface for '$TUN_NAME' was not found" "keen-singbox restart"
+      iface="$expected_iface"
+    fi
+    iface_address="$(get_address_by_iface "$iface" 2>/dev/null || true)"
+    [ -z "$iface_address" ] || [ "$iface_address" = "${TUN_ADDRESS%%/*}" ] &&
+      ok "Keenetic OpkgTun address looks valid: ${iface_address:-not found yet}" ||
+      doctor_fix "Keenetic OpkgTun address '$iface_address' does not match '${TUN_ADDRESS%%/*}'" "recreate $expected_iface or fix tun.address in $SETTINGS"
+  else
+    doctor_fix "tun.interface_name must look like opkgtun0" "edit tun.interface_name in $SETTINGS"
+  fi
+
+  link_state="$("$IP_BIN" link show dev "$TUN_INTERFACE_NAME" 2>/dev/null | head -n1 || true)"
+  if [ -n "$link_state" ]; then
+    printf '%s' "$link_state" | grep -q 'state DOWN' &&
+      doctor_fix "Linux interface $TUN_INTERFACE_NAME is down: $link_state" "keen-singbox restart" ||
+      ok "Linux interface $TUN_INTERFACE_NAME is up"
+  else
+    doctor_fix "Linux interface $TUN_INTERFACE_NAME was not found" "keen-singbox restart"
+  fi
+
+  table4="$(get_policy_table4 2>/dev/null || true)"
+  if [ -n "$table4" ]; then
+    ok "policy table found: $table4"
+    route_state="$("$IP_BIN" route show table "$table4" 2>/dev/null | grep '^default' || true)"
+    if [ -n "$route_state" ]; then
+      route_problem="$(policy_route_problem "$route_state" || true)"
+      [ -z "$route_problem" ] && ok "policy table default route looks valid" ||
+        doctor_fix "$route_problem" "keen-singbox restart"
+    else
+      doctor_fix "policy table $table4 has no default route" "keen-singbox restart"
+    fi
+  else
+    doctor_fix "policy table not found for '$POLICY_NAME'" "set policy.table4 in $SETTINGS"
+  fi
+
+  txqueuelen="$(get_iface_txqueuelen || true)"
+  if [ "$TUN_TXQUEUELEN" -gt 0 ] 2>/dev/null; then
+    [ "$txqueuelen" = "$TUN_TXQUEUELEN" ] &&
+      ok "TUN txqueuelen matches settings: $TUN_TXQUEUELEN" ||
+      doctor_fix "TUN txqueuelen is '${txqueuelen:-unknown}', expected '$TUN_TXQUEUELEN'" "keen-singbox set-txqueuelen $TUN_TXQUEUELEN"
+  else
+    info "TUN txqueuelen is not managed by settings"
+  fi
+
+  command -v "$IPTABLES_BIN" >/dev/null 2>&1 && ok "iptables found" ||
+    doctor_fix "iptables not found; TUN firewall rules cannot be checked" "install dependencies: keen-singbox install"
+  firewall_status="$(get_tun_firewall_status || true)"
+  [ "$firewall_status" = "applied" ] || [ "$firewall_status" = "disabled" ] &&
+    ok "TUN firewall: $firewall_status" ||
+    {
+      firewall_diagnostics="$(get_tun_firewall_diagnostics || true)"
+      doctor_fix "TUN firewall: ${firewall_status:-unknown} ($firewall_diagnostics)" "keen-singbox restart"
+    }
+  firewall_hook_status="$(get_firewall_hook_status || true)"
+  [ "$firewall_hook_status" = "installed" ] || [ "$firewall_hook_status" = "disabled" ] &&
+    ok "TUN firewall hook: $firewall_hook_status" ||
+    doctor_fix "TUN firewall hook: ${firewall_hook_status:-unknown}" "keen-singbox restart"
+
+  cache_path="$(get_config_field '@.experimental.cache_file.path' 2>/dev/null || true)"
+  [ -n "$cache_path" ] && info "Configured cache file: $cache_path"
+  check_remote_rule_sets
+  [ -f "$PID_FILE" ] && info "PID file: $PID_FILE pid=$(sed -n '1p' "$PID_FILE" 2>/dev/null)" ||
+    doctor_fix "PID file missing: $PID_FILE" "keen-singbox restart"
+  is_running && ok "tracked sing-box process is running" ||
+    doctor_fix "tracked sing-box process is not running" "keen-singbox restart"
+}
+
+case "$ACTION" in
+  install) install_all "${2:-${KEEN_SINGBOX_PROFILE:-default}}" ;;
+  install-config) install_active_config "${2:-${KEEN_SINGBOX_PROFILE:-default}}" ;;
+  install-singbox) [ -f "$SETTINGS" ] && load_settings; install_singbox ;;
+  install-init) install_init ;;
+  validate) validate_config_file ;;
+  start) with_service_lock start_service "${2:-}" ;;
+  stop) with_service_lock stop_service ;;
+  restart) with_service_lock restart_service ;;
+  reload) with_service_lock reload_service ;;
+  status) status ;;
+  logs) logs ;;
+  clean-runtime) check_settings; clean_runtime_cache_file ;;
+  set-txqueuelen) check_settings; set_txqueuelen_setting "${2:-}" ;;
+  doctor) doctor ;;
+  __test-iface-by-name) load_settings; get_iface_by_name "$TUN_NAME" ;;
+  __test-policy-table) load_settings; get_policy_table4 ;;
+  __test-policy-route) load_settings; ensure_policy_route ;;
+  __test-policy-route-remove) load_settings; remove_policy_route ;;
+  __test-lock) with_service_lock true ;;
+  __test-expected-opkgtun) load_settings; expected_opkgtun_iface ;;
+  __test-opkgtun-binding) load_settings; validate_opkgtun_binding ;;
+  __test-link-up) load_settings; ensure_link_up "$(expected_opkgtun_iface)" ;;
+  __test-firewall-apply) load_settings; ensure_tun_firewall_rules ;;
+  __test-firewall-remove) load_settings; remove_tun_firewall_rules ;;
+  __test-firewall-status) load_settings; get_tun_firewall_status ;;
+  __test-firewall-diagnostics) load_settings; get_tun_firewall_diagnostics ;;
+  __test-firewall-hook-install) load_settings; install_firewall_hook ;;
+  __test-firewall-hook-remove) load_settings; remove_firewall_hook ;;
+  __test-firewall-hook-status) load_settings; get_firewall_hook_status ;;
+  __hook-firewall) load_settings; ensure_tun_firewall_rules ;;
+  __test-write-runner) load_settings; write_singbox_runner "$(get_singbox_log_file)"; echo "$RUNNER_SCRIPT" ;;
+  __test-format-bytes) format_bytes "${2:-0}" ;;
+  __test-log) load_settings; log ERROR "${2:-test}" ;;
+  help|-h|--help|"") show_help ;;
+  *) show_help; exit 1 ;;
+esac

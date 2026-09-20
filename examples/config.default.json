@@ -1,0 +1,499 @@
+{
+  "log": {
+    "level": "fatal",
+    "disabled": false,
+    "output": "/tmp/keen-singbox/sing-box.log",
+    "timestamp": true
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "0.0.0.0:9999",
+      "secret": "",
+      "default_mode": "rule"
+    },
+    "cache_file": {
+      "enabled": true,
+      "path": "/tmp/keen-singbox/cache.db"
+    }
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": "172.19.0.1/30",
+      "mtu": 1400,
+      "auto_route": false,
+      "strict_route": false,
+      "stack": "mixed",
+      "endpoint_independent_nat": true,
+      "interface_name": "opkgtun0"
+    }
+  ],
+  "dns": {
+    "servers": [
+      {
+        "type": "local",
+        "tag": "dns-bootstrap"
+      },
+      {
+        "type": "https",
+        "tag": "dns-primary",
+        "server": "1.1.1.1",
+        "path": "/dns-query",
+        "detour": "proxy",
+        "tls": {
+          "server_name": "cloudflare-dns.com"
+        }
+      },
+      {
+        "type": "https",
+        "tag": "dns-fallback-1",
+        "server": "1.0.0.1",
+        "path": "/dns-query",
+        "detour": "proxy",
+        "tls": {
+          "server_name": "cloudflare-dns.com"
+        }
+      },
+      {
+        "type": "https",
+        "tag": "dns-fallback-2",
+        "server": "8.8.8.8",
+        "path": "/dns-query",
+        "detour": "proxy",
+        "tls": {
+          "server_name": "dns.google"
+        }
+      },
+      {
+        "type": "https",
+        "tag": "dns-fallback-3",
+        "server": "9.9.9.9",
+        "path": "/dns-query",
+        "detour": "proxy",
+        "tls": {
+          "server_name": "dns.quad9.net"
+        }
+      }
+    ],
+    "strategy": "ipv4_only",
+    "final": "dns-primary",
+    "cache_capacity": 1024,
+    "independent_cache": true,
+    "reverse_mapping": true
+  },
+  "outbounds": [
+    {
+      "type": "urltest",
+      "tag": "proxy",
+      "outbounds": [
+        "hysteria2",
+        "tuic"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "30m",
+      "tolerance": 50,
+      "idle_timeout": "1h",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "selector",
+      "tag": "proxy-select",
+      "outbounds": [
+        "proxy",
+        "hysteria2",
+        "tuic",
+        "direct"
+      ],
+      "default": "proxy",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2",
+      "server": "your-hysteria2.example.com",
+      "server_port": 443,
+      "domain_resolver": "dns-bootstrap",
+      "password": "CHANGE_ME_HYSTERIA2_PASSWORD",
+      "up_mbps": 100,
+      "down_mbps": 100,
+      "tls": {
+        "enabled": true,
+        "server_name": "your-hysteria2.example.com"
+      }
+    },
+    {
+      "type": "tuic",
+      "tag": "tuic",
+      "server": "your-tuic.example.com",
+      "server_port": 443,
+      "domain_resolver": "dns-bootstrap",
+      "uuid": "00000000-0000-4000-8000-000000000001",
+      "password": "CHANGE_ME_TUIC_PASSWORD",
+      "congestion_control": "bbr",
+      "zero_rtt_handshake": false,
+      "tls": {
+        "enabled": true,
+        "server_name": "your-tuic.example.com",
+        "alpn": [
+          "h3"
+        ]
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": {
+      "server": "dns-bootstrap",
+      "strategy": "ipv4_only"
+    },
+    "rules": [
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "port": 53,
+        "action": "hijack-dns"
+      },
+      {
+        "network": "tcp",
+        "port": 853,
+        "action": "reject"
+      },
+      {
+        "action": "sniff",
+        "timeout": "500ms"
+      },
+      {
+        "rule_set": [
+          "telegram-geosite",
+          "telegram-geoip",
+          "youtube-geosite",
+          "openai-geosite",
+          "openai-ads-geosite",
+          "ai-chat-geosite",
+          "ai-geoip",
+          "stripe-geosite",
+          "autodesk-geosite"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "network": [
+          "tcp",
+          "udp"
+        ],
+        "domain": [
+          "telegram.org",
+          "telegram.me",
+          "telegram.dog",
+          "t.me",
+          "tdesktop.com",
+          "telegra.ph"
+        ],
+        "domain_suffix": [
+          ".telegram.org",
+          ".telegram.me",
+          ".telegram.dog",
+          ".t.me",
+          ".tdesktop.com",
+          ".telegra.ph"
+        ],
+        "ip_cidr": [
+          "91.105.192.0/23",
+          "91.108.4.0/22",
+          "91.108.8.0/22",
+          "91.108.12.0/22",
+          "91.108.16.0/22",
+          "91.108.20.0/22",
+          "91.108.56.0/22",
+          "95.161.64.0/20",
+          "149.154.160.0/20",
+          "185.76.151.0/24"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "network": [
+          "tcp",
+          "udp"
+        ],
+        "domain": [
+          "chatgpt.com",
+          "chat.com",
+          "crixet.com",
+          "openai.com",
+          "api.openai.com",
+          "auth.openai.com",
+          "auth0.openai.com",
+          "platform.openai.com",
+          "openai.com.cdn.cloudflare.net",
+          "openaiapi-site.azureedge.net",
+          "openaicom-api-bdcpf8c6d2e9atf6.z01.azurefd.net",
+          "openaicom.imgix.net",
+          "openaicomproductionae4b.blob.core.windows.net",
+          "production-openaicom-storage.azureedge.net",
+          "sora.com",
+          "claude.ai",
+          "claude.com",
+          "anthropic.com",
+          "api.anthropic.com",
+          "console.anthropic.com",
+          "perplexity.ai",
+          "poe.com",
+          "openrouter.ai",
+          "mistral.ai",
+          "chat.mistral.ai",
+          "huggingface.co",
+          "replicate.com",
+          "together.ai",
+          "cohere.com",
+          "gemini.google.com",
+          "aistudio.google.com",
+          "generativelanguage.googleapis.com",
+          "ai.google.dev",
+          "grok.com",
+          "x.ai"
+        ],
+        "domain_suffix": [
+          ".chatgpt.com",
+          ".chat.com",
+          ".crixet.com",
+          ".openai.com",
+          ".oaistatic.com",
+          ".oaiusercontent.com",
+          ".openai.com.cdn.cloudflare.net",
+          ".azurefd.net",
+          ".azureedge.net",
+          ".blob.core.windows.net",
+          ".imgix.net",
+          ".sora.com",
+          ".chatgpt.livekit.cloud",
+          ".host.livekit.cloud",
+          ".turn.livekit.cloud",
+          ".statsigapi.net",
+          ".workos.com",
+          ".workoscdn.com",
+          ".intercom.io",
+          ".intercomcdn.com",
+          ".claude.ai",
+          ".claude.com",
+          ".anthropic.com",
+          ".perplexity.ai",
+          ".poe.com",
+          ".openrouter.ai",
+          ".mistral.ai",
+          ".huggingface.co",
+          ".replicate.com",
+          ".together.ai",
+          ".cohere.com",
+          ".gemini.google.com",
+          ".aistudio.google.com",
+          ".generativelanguage.googleapis.com",
+          ".ai.google.dev",
+          ".grok.com",
+          ".x.ai"
+        ],
+        "domain_regex": [
+          "^chatgpt-async-webps-prod-[A-Za-z0-9-]+-[0-9]+\\.webpubsub\\.azure\\.com$"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "network": [
+          "tcp",
+          "udp"
+        ],
+        "domain": [
+          "youtube.com",
+          "www.youtube.com",
+          "m.youtube.com",
+          "music.youtube.com",
+          "youtu.be",
+          "youtubei.googleapis.com",
+          "youtube.googleapis.com",
+          "yt3.ggpht.com"
+        ],
+        "domain_suffix": [
+          ".youtube.com",
+          ".youtu.be",
+          ".googlevideo.com",
+          ".ytimg.com",
+          ".ggpht.com",
+          ".youtubei.googleapis.com",
+          ".youtube.googleapis.com",
+          ".youtube-nocookie.com",
+          ".gvt1.com",
+          ".gvt2.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "network": [
+          "tcp",
+          "udp"
+        ],
+        "domain": [
+          "max.ru"
+        ],
+        "domain_suffix": [
+          ".max.ru"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "network": "udp",
+        "port": 443,
+        "action": "reject"
+      },
+      {
+        "network": [
+          "tcp",
+          "udp"
+        ],
+        "domain": [
+          "russvet.ru",
+          "rsvet.it",
+          "market.yandex.ru",
+          "yandex.ru",
+          "therszh.top",
+          "ha.therszh.top"
+        ],
+        "domain_suffix": [
+          ".therszh.top",
+          ".vk.com",
+          ".vk.ru",
+          ".vkvideo.ru",
+          ".userapi.com",
+          ".vkuseraudio.net",
+          ".yandex.ru",
+          ".yandex.net",
+          ".yandex.com",
+          ".ya.ru",
+          ".yastatic.net",
+          ".mail.ru",
+          ".mycdn.me",
+          ".imgsmail.ru",
+          ".list.ru",
+          ".bk.ru",
+          ".inbox.ru",
+          ".internet.ru",
+          ".github.com",
+          ".githubusercontent.com",
+          ".githubassets.com",
+          ".ghcr.io",
+          ".docker.com",
+          ".docker.io",
+          ".gov.ru"
+        ],
+        "ip_cidr": [
+          "192.168.0.0/16",
+          "10.10.248.91",
+          "172.16.0.0/16",
+          "10.10.10.0/24",
+          "10.0.0.0/8",
+          "127.0.0.0/8",
+          "224.0.0.0/4",
+          "80.246.69.147"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "rule_set": [
+          "proxy"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      }
+    ],
+    "rule_set": [
+      {
+        "tag": "proxy",
+        "type": "remote",
+        "format": "binary",
+        "download_detour": "proxy",
+        "url": "https://cdn.jsdelivr.net/gh/jinndi/singbox_ruleset@main/proxy.srs"
+      },
+      {
+        "tag": "telegram-geosite",
+        "type": "remote",
+        "format": "binary",
+        "download_detour": "proxy",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/telegram.srs"
+      },
+      {
+        "tag": "telegram-geoip",
+        "type": "remote",
+        "format": "binary",
+        "download_detour": "proxy",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/telegram.srs"
+      },
+      {
+        "tag": "youtube-geosite",
+        "type": "remote",
+        "format": "binary",
+        "download_detour": "proxy",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/youtube.srs"
+      },
+      {
+        "tag": "openai-geosite",
+        "type": "remote",
+        "format": "binary",
+        "download_detour": "proxy",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/openai.srs"
+      },
+      {
+        "tag": "openai-ads-geosite",
+        "type": "remote",
+        "format": "binary",
+        "download_detour": "proxy",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/openai@ads.srs"
+      },
+      {
+        "tag": "ai-chat-geosite",
+        "type": "remote",
+        "format": "binary",
+        "download_detour": "proxy",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-ai-chat-!cn.srs"
+      },
+      {
+        "tag": "ai-geoip",
+        "type": "remote",
+        "format": "binary",
+        "download_detour": "proxy",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/ai.srs"
+      },
+      {
+        "tag": "stripe-geosite",
+        "type": "remote",
+        "format": "binary",
+        "download_detour": "proxy",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/stripe.srs"
+      },
+      {
+        "tag": "autodesk-geosite",
+        "type": "remote",
+        "format": "binary",
+        "download_detour": "proxy",
+        "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/autodesk.srs"
+      }
+    ],
+    "final": "direct"
+  }
+}
