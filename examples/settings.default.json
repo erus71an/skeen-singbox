@@ -23,7 +23,8 @@
     "log_level": "warn"
   },
   "firewall": {
-    "tun_rules_enabled": 1
+    "tun_rules_enabled": 1,
+    "ipv6_block_macs": []
   },
   "auto_start": {
     "enabled": 1,

@@ -32,11 +32,13 @@ JSONFILTER_BIN="${KEEN_SINGBOX_JSONFILTER:-jsonfilter}"
 NDMC_BIN="${KEEN_SINGBOX_NDMC:-ndmc}"
 IP_BIN="${KEEN_SINGBOX_IP:-ip}"
 IPTABLES_BIN="${KEEN_SINGBOX_IPTABLES:-iptables}"
+IP6TABLES_BIN="${KEEN_SINGBOX_IP6TABLES:-ip6tables}"
 INTERFACE_DATA_CACHE=""
 POLICY_DATA_CACHE=""
 IP_RULE_DATA_CACHE=""
 CHAIN_TUN="keen_singbox_tun"
 CHAIN_TUN_NAT="keen_singbox_nat"
+CHAIN_IPV6_BLOCK="keen_singbox_ipv6"
 LOG_MAX_BYTES="${KEEN_SINGBOX_LOG_MAX_BYTES:-524288}"
 LOG_BACKUPS="${KEEN_SINGBOX_LOG_BACKUPS:-2}"
 
@@ -222,6 +224,14 @@ json_get() {
   "$JSONFILTER_BIN" -i "$file" -e "$expr" 2>/dev/null | head -n1
 }
 
+json_get_all() {
+  local file="${1:-}"
+  local expr="${2:-}"
+
+  [ -f "$file" ] || return 1
+  "$JSONFILTER_BIN" -i "$file" -e "$expr" 2>/dev/null
+}
+
 load_settings() {
   [ -f "$SETTINGS" ] || die "Settings not found: $SETTINGS. Run: keen-singbox install"
 
@@ -241,6 +251,7 @@ load_settings() {
   RUNTIME_DIR_SETTING="$(json_get "$SETTINGS" '@.runtime.dir')"
   LOG_LEVEL="$(json_get "$SETTINGS" '@.runtime.log_level')"
   FIREWALL_TUN_RULES_ENABLED="$(json_get "$SETTINGS" '@.firewall.tun_rules_enabled')"
+  FIREWALL_IPV6_BLOCK_MACS="$(json_get_all "$SETTINGS" '@.firewall.ipv6_block_macs[*]' || true)"
   AUTO_START_ENABLED="$(json_get "$SETTINGS" '@.auto_start.enabled')"
   AUTO_START_DELAY="$(json_get "$SETTINGS" '@.auto_start.delay')"
 
@@ -260,6 +271,7 @@ load_settings() {
   : "${RUNTIME_DIR_SETTING:=$RUNTIME_DIR}"
   : "${LOG_LEVEL:=error}"
   : "${FIREWALL_TUN_RULES_ENABLED:=1}"
+  : "${FIREWALL_IPV6_BLOCK_MACS:=}"
   : "${AUTO_START_ENABLED:=1}"
   : "${AUTO_START_DELAY:=30}"
 
@@ -742,7 +754,7 @@ clean_runtime_cache_file() {
 }
 
 check_settings() {
-  local address
+  local address mac
 
   require_command "$JSONFILTER_BIN"
   [ -f "$SETTINGS" ] || die "Settings not found: $SETTINGS"
@@ -768,9 +780,19 @@ check_settings() {
     ""|[0-9]*.[0-9]*.[0-9]*) ;;
     *) die "singbox.version must look like 1.13.20 when set" ;;
   esac
+  while IFS= read -r mac; do
+    [ -z "$mac" ] || is_valid_mac "$mac" ||
+      die "Invalid MAC in firewall.ipv6_block_macs: $mac"
+  done <<EOF
+$FIREWALL_IPV6_BLOCK_MACS
+EOF
 
   address="${TUN_ADDRESS%%/*}"
   is_valid_ipv4 "$address" || die "Invalid tun.address: $TUN_ADDRESS"
+}
+
+is_valid_mac() {
+  printf '%s\n' "${1:-}" | grep -Eq '^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$'
 }
 
 set_txqueuelen_setting() {
@@ -1114,6 +1136,19 @@ ensure_iptables_rule() {
     die "Failed to add iptables $table rule: $*"
 }
 
+ensure_ip6tables_rule() {
+  local table="${1:-}"
+
+  shift || return 1
+  "$IP6TABLES_BIN" -w -t "$table" -C "$@" >/dev/null 2>&1 ||
+    run_cmd "$IP6TABLES_BIN" -w -t "$table" -A "$@" >/dev/null ||
+    die "Failed to add ip6tables $table rule: $*"
+}
+
+firewall_hook_required() {
+  [ "$FIREWALL_TUN_RULES_ENABLED" = "1" ] || [ -n "$FIREWALL_IPV6_BLOCK_MACS" ]
+}
+
 ensure_tun_firewall_rules() {
   [ "$FIREWALL_TUN_RULES_ENABLED" = "1" ] || return 0
   if ! command -v "$IPTABLES_BIN" >/dev/null 2>&1; then
@@ -1136,6 +1171,29 @@ ensure_tun_firewall_rules() {
   ok "TUN firewall rules are applied for $TUN_INTERFACE_NAME"
 }
 
+ensure_ipv6_client_block_rules() {
+  local mac
+
+  [ -n "$FIREWALL_IPV6_BLOCK_MACS" ] || return 0
+  if ! command -v "$IP6TABLES_BIN" >/dev/null 2>&1; then
+    warn "ip6tables was not found; per-client IPv6 blocking was not applied"
+    return 0
+  fi
+
+  run_cmd "$IP6TABLES_BIN" -w -t filter -N "$CHAIN_IPV6_BLOCK" >/dev/null 2>&1 || true
+  ensure_ip6tables_rule filter FORWARD -j "$CHAIN_IPV6_BLOCK"
+  run_cmd "$IP6TABLES_BIN" -w -t filter -F "$CHAIN_IPV6_BLOCK" >/dev/null ||
+    die "Failed to flush ip6tables chain $CHAIN_IPV6_BLOCK"
+  while IFS= read -r mac; do
+    [ -z "$mac" ] ||
+      run_cmd "$IP6TABLES_BIN" -w -t filter -A "$CHAIN_IPV6_BLOCK" -m mac --mac-source "$mac" -j REJECT >/dev/null ||
+      die "Failed to block IPv6 for MAC $mac"
+  done <<EOF
+$FIREWALL_IPV6_BLOCK_MACS
+EOF
+  ok "IPv6 is blocked for $(printf '%s\n' "$FIREWALL_IPV6_BLOCK_MACS" | count_nonempty_lines) configured client(s)"
+}
+
 remove_legacy_tun_nat_rule() {
   run_cmd "$IPTABLES_BIN" -w -t nat -D POSTROUTING -o "$TUN_INTERFACE_NAME" -j MASQUERADE -m comment --comment "$CHAIN_TUN" >/dev/null 2>&1 || true
 }
@@ -1148,9 +1206,9 @@ write_firewall_hook_content() {
 hook_type="\${type:-\${2:-}}"
 hook_table="\${table:-\${1:-}}"
 
-[ "\$hook_type" = "iptables" ] || exit 0
-case "\$hook_table" in
-  filter|nat) ;;
+[ "\$hook_type" = "iptables" ] || [ "\$hook_type" = "ip6tables" ] || exit 0
+case "\$hook_type:\$hook_table" in
+  iptables:filter|iptables:nat|ip6tables:filter) ;;
   *) exit 0 ;;
 esac
 
@@ -1161,9 +1219,15 @@ EOF
 install_firewall_hook() {
   local tmp_hook
 
-  [ "$FIREWALL_TUN_RULES_ENABLED" = "1" ] || return 0
-  if ! command -v "$IPTABLES_BIN" >/dev/null 2>&1; then
-    warn "iptables was not found; TUN firewall hook was not installed"
+  firewall_hook_required || return 0
+  if [ "$FIREWALL_TUN_RULES_ENABLED" = "1" ] && ! command -v "$IPTABLES_BIN" >/dev/null 2>&1; then
+    warn "iptables was not found; IPv4 TUN rules cannot be restored by the firewall hook"
+  fi
+  if [ -n "$FIREWALL_IPV6_BLOCK_MACS" ] && ! command -v "$IP6TABLES_BIN" >/dev/null 2>&1; then
+    warn "ip6tables was not found; IPv6 client blocks cannot be restored by the firewall hook"
+  fi
+  if ! command -v "$IPTABLES_BIN" >/dev/null 2>&1 && ! command -v "$IP6TABLES_BIN" >/dev/null 2>&1; then
+    warn "iptables and ip6tables were not found; firewall hook was not installed"
     return 0
   fi
 
@@ -1203,6 +1267,42 @@ remove_tun_firewall_rules() {
   run_cmd "$IPTABLES_BIN" -w -t filter -F "$CHAIN_TUN" >/dev/null 2>&1 || true
   run_cmd "$IPTABLES_BIN" -w -t filter -X "$CHAIN_TUN" >/dev/null 2>&1 || true
   ok "TUN firewall rules are removed for $TUN_INTERFACE_NAME"
+}
+
+remove_ipv6_client_block_rules() {
+  command -v "$IP6TABLES_BIN" >/dev/null 2>&1 || return 0
+
+  run_cmd "$IP6TABLES_BIN" -w -t filter -D FORWARD -j "$CHAIN_IPV6_BLOCK" >/dev/null 2>&1 || true
+  run_cmd "$IP6TABLES_BIN" -w -t filter -F "$CHAIN_IPV6_BLOCK" >/dev/null 2>&1 || true
+  run_cmd "$IP6TABLES_BIN" -w -t filter -X "$CHAIN_IPV6_BLOCK" >/dev/null 2>&1 || true
+  [ -z "$FIREWALL_IPV6_BLOCK_MACS" ] || ok "Per-client IPv6 block rules are removed"
+}
+
+get_ipv6_client_block_status() {
+  local mac
+
+  [ -n "$FIREWALL_IPV6_BLOCK_MACS" ] || {
+    echo "disabled"
+    return 0
+  }
+  command -v "$IP6TABLES_BIN" >/dev/null 2>&1 || {
+    echo "ip6tables not found"
+    return 0
+  }
+  "$IP6TABLES_BIN" -w -t filter -C FORWARD -j "$CHAIN_IPV6_BLOCK" >/dev/null 2>&1 || {
+    echo "missing"
+    return 0
+  }
+  while IFS= read -r mac; do
+    [ -z "$mac" ] ||
+      "$IP6TABLES_BIN" -w -t filter -C "$CHAIN_IPV6_BLOCK" -m mac --mac-source "$mac" -j REJECT >/dev/null 2>&1 || {
+        echo "missing"
+        return 0
+      }
+  done <<EOF
+$FIREWALL_IPV6_BLOCK_MACS
+EOF
+  echo "applied ($(printf '%s\n' "$FIREWALL_IPV6_BLOCK_MACS" | count_nonempty_lines) client(s))"
 }
 
 get_tun_firewall_status() {
@@ -1246,7 +1346,7 @@ get_tun_firewall_diagnostics() {
 }
 
 get_firewall_hook_status() {
-  [ "$FIREWALL_TUN_RULES_ENABLED" = "1" ] || {
+  firewall_hook_required || {
     echo "disabled"
     return 0
   }
@@ -1393,6 +1493,7 @@ start_service() {
   }
   install_firewall_hook
   ensure_tun_firewall_rules
+  ensure_ipv6_client_block_rules
   ensure_policy_route
   route_recheck
   ok "Service startup completed"
@@ -1427,6 +1528,7 @@ restart_service() {
 stop_service() {
   remove_policy_route
   remove_firewall_hook
+  remove_ipv6_client_block_rules
   remove_tun_firewall_rules
   stop_singbox
 }
@@ -1822,6 +1924,7 @@ install_all() {
 status() {
   local iface iface_address table4 route_state link_state version
   local inbound_iface proxy_status traffic_sample firewall_status firewall_hook_status
+  local ipv6_block_status
   local txqueuelen route_problem
 
   check_settings
@@ -1836,6 +1939,7 @@ status() {
   proxy_status="$(get_proxy_status || true)"
   traffic_sample="$(get_iface_traffic_sample || true)"
   firewall_status="$(get_tun_firewall_status || true)"
+  ipv6_block_status="$(get_ipv6_client_block_status || true)"
   firewall_hook_status="$(get_firewall_hook_status || true)"
   txqueuelen="$(get_iface_txqueuelen || true)"
 
@@ -1858,6 +1962,7 @@ status() {
   echo "Traffic: ${traffic_sample:-not available}"
   echo "TUN txqueuelen: configured=$TUN_TXQUEUELEN current=${txqueuelen:-unknown}"
   echo "TUN firewall: ${firewall_status:-unknown}"
+  echo "IPv6 client block: ${ipv6_block_status:-unknown}"
   echo "TUN firewall hook: ${firewall_hook_status:-unknown}"
   echo "Runtime: $RUNTIME_DIR"
 }
@@ -1872,6 +1977,7 @@ doctor() {
   local table4 cache_path route_state route_problem link_state txqueuelen
   local expected_iface iface iface_address inbound_iface inbound_addr auto_route
   local firewall_status firewall_hook_status firewall_diagnostics core_version
+  local ipv6_block_status
 
   check_settings
   info "Configured policy.name: $POLICY_NAME"
@@ -1991,6 +2097,15 @@ doctor() {
       firewall_diagnostics="$(get_tun_firewall_diagnostics || true)"
       doctor_fix "TUN firewall: ${firewall_status:-unknown} ($firewall_diagnostics)" "keen-singbox restart"
     }
+  if [ -n "$FIREWALL_IPV6_BLOCK_MACS" ]; then
+    command -v "$IP6TABLES_BIN" >/dev/null 2>&1 && ok "ip6tables found" ||
+      doctor_fix "ip6tables not found; IPv6 client blocks cannot be checked" "install ip6tables support"
+  fi
+  ipv6_block_status="$(get_ipv6_client_block_status || true)"
+  case "$ipv6_block_status" in
+    applied*|disabled) ok "IPv6 client block: $ipv6_block_status" ;;
+    *) doctor_fix "IPv6 client block: ${ipv6_block_status:-unknown}" "keen-singbox restart" ;;
+  esac
   firewall_hook_status="$(get_firewall_hook_status || true)"
   [ "$firewall_hook_status" = "installed" ] || [ "$firewall_hook_status" = "disabled" ] &&
     ok "TUN firewall hook: $firewall_hook_status" ||
@@ -2031,11 +2146,14 @@ case "$ACTION" in
   __test-firewall-apply) load_settings; ensure_tun_firewall_rules ;;
   __test-firewall-remove) load_settings; remove_tun_firewall_rules ;;
   __test-firewall-status) load_settings; get_tun_firewall_status ;;
+  __test-ipv6-block-apply) load_settings; ensure_ipv6_client_block_rules ;;
+  __test-ipv6-block-remove) load_settings; remove_ipv6_client_block_rules ;;
+  __test-ipv6-block-status) load_settings; get_ipv6_client_block_status ;;
   __test-firewall-diagnostics) load_settings; get_tun_firewall_diagnostics ;;
   __test-firewall-hook-install) load_settings; install_firewall_hook ;;
   __test-firewall-hook-remove) load_settings; remove_firewall_hook ;;
   __test-firewall-hook-status) load_settings; get_firewall_hook_status ;;
-  __hook-firewall) load_settings; ensure_tun_firewall_rules ;;
+  __hook-firewall) load_settings; ensure_tun_firewall_rules; ensure_ipv6_client_block_rules ;;
   __test-write-runner) load_settings; write_singbox_runner "$(get_singbox_log_file)"; echo "$RUNNER_SCRIPT" ;;
   __test-format-bytes) format_bytes "${2:-0}" ;;
   __test-log) load_settings; log ERROR "${2:-test}" ;;

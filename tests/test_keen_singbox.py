@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -20,9 +21,9 @@ def make_jsonfilter(tmp_path: Path) -> Path:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     jsonfilter = bin_dir / "jsonfilter"
-    jsonfilter.write_text(
-        f"#!{sys.executable}\n"
-        + """
+    implementation = bin_dir / "jsonfilter.py"
+    implementation.write_text(
+        """
 import json
 import sys
 
@@ -50,6 +51,11 @@ if expr == '@.route.rule_set[@.type="remote"].url':
     for item in data.get("route", {}).get("rule_set", []):
         if item.get("type") == "remote" and item.get("url") is not None:
             print(item["url"])
+    sys.exit(0)
+
+if expr == '@.firewall.ipv6_block_macs[*]':
+    for item in data.get("firewall", {}).get("ipv6_block_macs", []):
+        print(item)
     sys.exit(0)
 
 if expr.startswith('@.inbounds[@.type="tun"].'):
@@ -81,6 +87,12 @@ elif value is not None:
 """,
         encoding="utf-8",
     )
+    jsonfilter.write_text(
+        "#!/bin/sh\n"
+        f"exec {shlex.quote(sys.executable)} "
+        f"{shlex.quote(str(implementation))} \"$@\"\n",
+        encoding="utf-8",
+    )
     jsonfilter.chmod(0o755)
     return bin_dir
 
@@ -101,6 +113,24 @@ exit 0
     )
     iptables.chmod(0o755)
     return iptables
+
+
+def make_ip6tables(tmp_path: Path, check_status: int = 1) -> Path:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    ip6tables = bin_dir / "ip6tables"
+    ip6tables.write_text(
+        f"""#!/bin/sh
+printf '%s\\n' "$*" >> "$IP6TABLES_LOG"
+case " $* " in
+  *" -C "*) exit {check_status} ;;
+esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    ip6tables.chmod(0o755)
+    return ip6tables
 
 
 def make_ip(tmp_path: Path) -> Path:
@@ -242,6 +272,7 @@ def test_lowmem_template_keeps_runtime_in_tmp() -> None:
 
     assert settings["runtime"]["dir"].startswith("/tmp/")
     assert settings["firewall"]["tun_rules_enabled"] == 1
+    assert settings["firewall"]["ipv6_block_macs"] == []
     assert settings["tun"]["txqueuelen"] == 0
     assert config["log"]["output"].startswith("/tmp/")
     assert config["experimental"]["cache_file"]["path"].startswith("/tmp/")
@@ -268,6 +299,7 @@ def test_default_template_is_not_direct_only_lowmem() -> None:
     assert settings["tun"]["name"] == "SKeen0"
     assert settings["tun"]["interface_name"] == "opkgtun0"
     assert settings["firewall"]["tun_rules_enabled"] == 1
+    assert settings["firewall"]["ipv6_block_macs"] == []
     assert settings["tun"]["txqueuelen"] == 2000
     assert settings["singbox"]["version"] == "1.13.20"
     assert tun_inbound["interface_name"] == "opkgtun0"
@@ -454,6 +486,61 @@ def test_firewall_status_reports_applied_or_missing(tmp_path: Path) -> None:
     assert applied.stdout.strip() == "applied"
     assert missing.returncode == 0, missing.stderr
     assert missing.stdout.strip() == "missing"
+
+
+def test_ipv6_client_block_uses_owned_chain_and_configured_mac(tmp_path: Path) -> None:
+    settings = json.loads(DEFAULT_SETTINGS.read_text(encoding="utf-8"))
+    settings["firewall"]["ipv6_block_macs"] = ["02:00:00:00:00:01"]
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps(settings), encoding="utf-8")
+    ip6tables = make_ip6tables(tmp_path, check_status=1)
+    ip6tables_log = tmp_path / "ip6tables.log"
+
+    result = run_script(
+        tmp_path,
+        "__test-ipv6-block-apply",
+        KEEN_SINGBOX_SETTINGS=str(settings_path),
+        KEEN_SINGBOX_DRY_RUN="0",
+        KEEN_SINGBOX_IP6TABLES=str(ip6tables),
+        IP6TABLES_LOG=str(ip6tables_log),
+    )
+
+    assert result.returncode == 0, result.stderr
+    logged = ip6tables_log.read_text(encoding="utf-8")
+    assert "-t filter -N keen_singbox_ipv6" in logged
+    assert "-t filter -A FORWARD -j keen_singbox_ipv6" in logged
+    assert "-t filter -F keen_singbox_ipv6" in logged
+    assert (
+        "-t filter -A keen_singbox_ipv6 -m mac "
+        "--mac-source 02:00:00:00:00:01 -j REJECT"
+    ) in logged
+    assert "IPv6 is blocked for 1 configured client(s)" in result.stdout
+
+
+def test_ipv6_client_block_status_and_remove(tmp_path: Path) -> None:
+    settings = json.loads(DEFAULT_SETTINGS.read_text(encoding="utf-8"))
+    settings["firewall"]["ipv6_block_macs"] = ["02:00:00:00:00:01"]
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps(settings), encoding="utf-8")
+    ip6tables = make_ip6tables(tmp_path, check_status=0)
+    ip6tables_log = tmp_path / "ip6tables.log"
+    env = {
+        "KEEN_SINGBOX_SETTINGS": str(settings_path),
+        "KEEN_SINGBOX_DRY_RUN": "0",
+        "KEEN_SINGBOX_IP6TABLES": str(ip6tables),
+        "IP6TABLES_LOG": str(ip6tables_log),
+    }
+
+    status = run_script(tmp_path, "__test-ipv6-block-status", **env)
+    remove = run_script(tmp_path, "__test-ipv6-block-remove", **env)
+
+    assert status.returncode == 0, status.stderr
+    assert status.stdout.strip() == "applied (1 client(s))"
+    assert remove.returncode == 0, remove.stderr
+    logged = ip6tables_log.read_text(encoding="utf-8")
+    assert "-t filter -D FORWARD -j keen_singbox_ipv6" in logged
+    assert "-t filter -F keen_singbox_ipv6" in logged
+    assert "-t filter -X keen_singbox_ipv6" in logged
 
 
 def test_is_running_accepts_live_pid_from_pidfile(tmp_path: Path) -> None:
@@ -762,6 +849,7 @@ def test_firewall_hook_install_is_idempotent_and_status_reports_it(
     assert hook.exists()
     assert os.access(hook, os.X_OK)
     assert "__hook-firewall" in hook.read_text(encoding="utf-8")
+    assert "ip6tables:filter" in hook.read_text(encoding="utf-8")
     assert hook.stat().st_mtime_ns == first_mtime
     assert status.stdout.strip() == "installed"
 
@@ -1251,9 +1339,9 @@ def test_expected_opkgtun_comes_from_configured_linux_iface(tmp_path: Path) -> N
 
 def make_stateful_iptables(tmp_path: Path) -> Path:
     iptables = tmp_path / "iptables-stateful"
-    iptables.write_text(
-        f"#!{sys.executable}\n"
-        + """
+    implementation = tmp_path / "iptables-stateful.py"
+    implementation.write_text(
+        """
 import json
 import os
 import sys
@@ -1298,6 +1386,12 @@ elif op == '-X':
     del table[chain]
 path.write_text(json.dumps(state))
 """,
+        encoding="utf-8",
+    )
+    iptables.write_text(
+        "#!/bin/sh\n"
+        f"exec {shlex.quote(sys.executable)} "
+        f"{shlex.quote(str(implementation))} \"$@\"\n",
         encoding="utf-8",
     )
     iptables.chmod(0o755)

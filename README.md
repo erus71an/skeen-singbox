@@ -254,6 +254,25 @@ chain and masquerade traffic leaving via `opkgtun0`. Disable them only with
 minimal rules when Keenetic rebuilds netfilter tables after interface, policy,
 or firewall changes. `keen-singbox stop` removes the hook and the current rules.
 
+Keenetic connection policies can route a client through the IPv4 OpkgTun while
+the same client still reaches the Internet directly over IPv6. For devices that
+must stay on the IPv4 policy, list their MAC addresses in `settings.json`:
+
+```json
+"firewall": {
+  "tun_rules_enabled": 1,
+  "ipv6_block_macs": [
+    "02:00:00:00:00:01"
+  ]
+}
+```
+
+After `keen-singbox restart`, the wrapper creates its own `ip6tables` chain and
+rejects forwarded IPv6 traffic only for those clients, causing them to use IPv4.
+`status` and `doctor` report `IPv6 client block: applied`; the firewall hook
+restores the rules after Keenetic rebuilds netfilter state. An empty list leaves
+IPv6 unchanged for every client.
+
 If startup stops at `Failed to add iptables nat rule`, the process may already
 be running while firewall and policy routing are still incomplete. Older
 versions required `xt_comment` to label the NAT rule; if that module was not
