@@ -1145,6 +1145,13 @@ ensure_ip6tables_rule() {
     die "Failed to add ip6tables $table rule: $*"
 }
 
+ensure_ipv6_block_jump_first() {
+  "$IP6TABLES_BIN" -w -t filter -C FORWARD -j "$CHAIN_IPV6_BLOCK" >/dev/null 2>&1 &&
+    run_cmd "$IP6TABLES_BIN" -w -t filter -D FORWARD -j "$CHAIN_IPV6_BLOCK" >/dev/null 2>&1 || true
+  run_cmd "$IP6TABLES_BIN" -w -t filter -I FORWARD 1 -j "$CHAIN_IPV6_BLOCK" >/dev/null ||
+    die "Failed to place ip6tables chain $CHAIN_IPV6_BLOCK first in FORWARD"
+}
+
 firewall_hook_required() {
   [ "$FIREWALL_TUN_RULES_ENABLED" = "1" ] || [ -n "$FIREWALL_IPV6_BLOCK_MACS" ]
 }
@@ -1181,7 +1188,9 @@ ensure_ipv6_client_block_rules() {
   fi
 
   run_cmd "$IP6TABLES_BIN" -w -t filter -N "$CHAIN_IPV6_BLOCK" >/dev/null 2>&1 || true
-  ensure_ip6tables_rule filter FORWARD -j "$CHAIN_IPV6_BLOCK"
+  # Keenetic may keep broad ACCEPT rules in FORWARD. The client block must run
+  # before them, otherwise the jump exists but never receives matching packets.
+  ensure_ipv6_block_jump_first
   run_cmd "$IP6TABLES_BIN" -w -t filter -F "$CHAIN_IPV6_BLOCK" >/dev/null ||
     die "Failed to flush ip6tables chain $CHAIN_IPV6_BLOCK"
   while IFS= read -r mac; do
@@ -1279,7 +1288,7 @@ remove_ipv6_client_block_rules() {
 }
 
 get_ipv6_client_block_status() {
-  local mac
+  local mac first_forward_rule
 
   [ -n "$FIREWALL_IPV6_BLOCK_MACS" ] || {
     echo "disabled"
@@ -1291,6 +1300,15 @@ get_ipv6_client_block_status() {
   }
   "$IP6TABLES_BIN" -w -t filter -C FORWARD -j "$CHAIN_IPV6_BLOCK" >/dev/null 2>&1 || {
     echo "missing"
+    return 0
+  }
+  first_forward_rule="$(
+    "$IP6TABLES_BIN" -w -t filter -S FORWARD 2>/dev/null |
+      grep '^-A FORWARD ' |
+      head -n1
+  )"
+  [ "$first_forward_rule" = "-A FORWARD -j $CHAIN_IPV6_BLOCK" ] || {
+    echo "misordered"
     return 0
   }
   while IFS= read -r mac; do

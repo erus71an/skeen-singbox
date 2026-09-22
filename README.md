@@ -269,6 +269,8 @@ must stay on the IPv4 policy, list their MAC addresses in `settings.json`:
 
 After `keen-singbox restart`, the wrapper creates its own `ip6tables` chain and
 rejects forwarded IPv6 traffic only for those clients, causing them to use IPv4.
+The managed jump is kept first in `FORWARD` so Keenetic's broader accept rules
+cannot bypass the client block.
 `status` and `doctor` report `IPv6 client block: applied`; the firewall hook
 restores the rules after Keenetic rebuilds netfilter state. An empty list leaves
 IPv6 unchanged for every client.

@@ -123,6 +123,10 @@ def make_ip6tables(tmp_path: Path, check_status: int = 1) -> Path:
         f"""#!/bin/sh
 printf '%s\\n' "$*" >> "$IP6TABLES_LOG"
 case " $* " in
+  *" -S FORWARD "*)
+    printf '%s\\n' "${{IP6TABLES_FORWARD_RULES:--A FORWARD -j keen_singbox_ipv6}}"
+    exit 0
+    ;;
   *" -C "*) exit {check_status} ;;
 esac
 exit 0
@@ -508,7 +512,7 @@ def test_ipv6_client_block_uses_owned_chain_and_configured_mac(tmp_path: Path) -
     assert result.returncode == 0, result.stderr
     logged = ip6tables_log.read_text(encoding="utf-8")
     assert "-t filter -N keen_singbox_ipv6" in logged
-    assert "-t filter -A FORWARD -j keen_singbox_ipv6" in logged
+    assert "-t filter -I FORWARD 1 -j keen_singbox_ipv6" in logged
     assert "-t filter -F keen_singbox_ipv6" in logged
     assert (
         "-t filter -A keen_singbox_ipv6 -m mac "
@@ -541,6 +545,29 @@ def test_ipv6_client_block_status_and_remove(tmp_path: Path) -> None:
     assert "-t filter -D FORWARD -j keen_singbox_ipv6" in logged
     assert "-t filter -F keen_singbox_ipv6" in logged
     assert "-t filter -X keen_singbox_ipv6" in logged
+
+
+def test_ipv6_client_block_status_detects_late_forward_jump(tmp_path: Path) -> None:
+    settings = json.loads(DEFAULT_SETTINGS.read_text(encoding="utf-8"))
+    settings["firewall"]["ipv6_block_macs"] = ["02:00:00:00:00:01"]
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps(settings), encoding="utf-8")
+    ip6tables = make_ip6tables(tmp_path, check_status=0)
+
+    status = run_script(
+        tmp_path,
+        "__test-ipv6-block-status",
+        KEEN_SINGBOX_SETTINGS=str(settings_path),
+        KEEN_SINGBOX_DRY_RUN="0",
+        KEEN_SINGBOX_IP6TABLES=str(ip6tables),
+        IP6TABLES_LOG=str(tmp_path / "ip6tables.log"),
+        IP6TABLES_FORWARD_RULES=(
+            "-A FORWARD -j ACCEPT\n-A FORWARD -j keen_singbox_ipv6"
+        ),
+    )
+
+    assert status.returncode == 0, status.stderr
+    assert status.stdout.strip() == "misordered"
 
 
 def test_is_running_accepts_live_pid_from_pidfile(tmp_path: Path) -> None:
